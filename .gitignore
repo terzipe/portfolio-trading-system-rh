@@ -1,0 +1,10 @@
+.env
+venv/
+__pycache__/
+*.pyc
+data/snapshots/
+data/news_cache.db
+data/positions/positions.json
+logs/
+*.log
+*.err
