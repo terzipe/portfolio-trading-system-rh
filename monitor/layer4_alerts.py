@@ -107,6 +107,15 @@ def render_dashboard(analytics: dict, market: dict, alerts: list[str]):
         flag = {"consider_exit": " ⚠", "consider_add": " ✚", "monitor": " ~"}.get(n["action_flag"], "")
         print(f"    [{n['sentiment'].upper()[:4]}]{flag}  {n['ticker']}: {n['summary']}")
 
+    ls_scores = market.get("ls_scores", {})
+    if ls_scores:
+        print("\n  LS EQUITY FUND FACTOR SCORES")
+        for ticker, s in ls_scores.items():
+            flag = s["long_short_flag"]
+            sym = "▲" if flag == "LONG" else ("▼" if flag == "SHORT" else "·")
+            print(f"    {ticker:<6} composite={s['composite']:.0f}  "
+                  f"mom={s['momentum']:.0f}  qual={s['quality']:.0f}  {sym} {flag}")
+
     if alerts:
         print("\n  ACTIVE ALERTS")
         for a in alerts:

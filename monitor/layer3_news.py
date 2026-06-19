@@ -165,8 +165,33 @@ Return a JSON array, one object per ticker. No prose outside the JSON.
     return result
 
 
+def _ls_factor_scores(tickers: list[str]) -> dict:
+    """Load LS equity fund composite scores for held tickers if the CSV exists."""
+    import csv
+    scored_path = Path(__file__).parent.parent.parent / "ls_equity_fund" / "output" / "scored_universe_latest.csv"
+    if not scored_path.exists():
+        return {}
+    scores: dict = {}
+    try:
+        with open(scored_path, newline="") as f:
+            for row in csv.DictReader(f):
+                t = row.get("ticker", "")
+                if t in tickers:
+                    scores[t] = {
+                        "composite": float(row.get("composite", 50) or 50),
+                        "momentum": float(row.get("momentum", 50) or 50),
+                        "quality": float(row.get("quality", 50) or 50),
+                        "long_short_flag": row.get("long_short_flag", "NEUTRAL"),
+                    }
+    except Exception:
+        pass
+    return scores
+
+
 def run(valued_positions: list[dict]) -> dict:
+    tickers = sorted({p["ticker"] for p in valued_positions})
     return {
         "macro": _macro_score(),
         "news": _claude_news_analysis(valued_positions),
+        "ls_scores": _ls_factor_scores(tickers),
     }
