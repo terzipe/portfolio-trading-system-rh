@@ -87,10 +87,35 @@ def value_positions(positions: list[dict]) -> list[dict]:
     return valued
 
 
-def run() -> list[dict]:
-    with open(POSITIONS_FILE) as f:
-        positions = json.load(f)
-    valued = value_positions(positions)
+def run(positions_override: list[dict] | None = None) -> list[dict]:
+    """
+    positions_override: pass live positions from layer0 to skip reading POSITIONS_FILE.
+    When provided, maps layer0 fields (avg_cost/price/market_value/pnl) to layer1's schema.
+    """
+    if positions_override is not None:
+        valued = []
+        for p in positions_override:
+            if p.get("type") not in ("share", "option"):
+                continue
+            if p["type"] == "share":
+                valued.append({
+                    "type": "share",
+                    "ticker": p["ticker"],
+                    "quantity": p["quantity"],
+                    "cost_basis": p.get("avg_cost", 0),
+                    "spot": p.get("price", 0),
+                    "market_value": p.get("market_value", 0),
+                    "pnl": p.get("pnl", 0),
+                    "pnl_pct": p.get("pnl_pct", 0),
+                    "sector": p.get("sector", "Unknown"),
+                    "source": p.get("source", "held"),
+                    "account": p.get("account", ""),
+                })
+    else:
+        with open(POSITIONS_FILE) as f:
+            positions = json.load(f)
+        valued = value_positions(positions)
+
     snapshot_path = SNAPSHOTS_DIR / f"{datetime.date.today().isoformat()}.json"
     with open(snapshot_path, "w") as f:
         json.dump(valued, f, indent=2, default=str)
