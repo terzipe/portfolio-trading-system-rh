@@ -137,7 +137,7 @@ def run(valued_positions: list[dict], analytics: dict, market: dict):
     render_dashboard(analytics, market, alerts)
 
     if alerts:
-        message = f"Portfolio Alert {analytics['as_of']}:\n" + "\n".join(alerts)
+        message = f"RH Tracker Alert {analytics['as_of']}:\n" + "\n".join(alerts)
         send_imessage(message)
 
     return alerts
