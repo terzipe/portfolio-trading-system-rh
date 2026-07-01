@@ -245,6 +245,67 @@ launchctl kickstart -k gui/$(id -u)/com.tvclaude.portfolio.daily
 | STOP alert fires on CASH-posture account | Alert not checking macro posture before firing | Add posture check before every STOP alert — see suppression rules above |
 | IV alert false-positive during earnings | Normal earnings IV move, not a signal | Flag as expected; suppress unless > 20pp single session |
 | Daily snapshot missing | Previous run crashed before write | Always write snapshot at end of run in finally block |
+| RH Tracker dashboard shows `NoneType has no attribute 'get'` | `robin_stocks login()` returned None — session expired | Run `rh_reauth.py` (see below) |
+| `rh_reauth.py` hangs at SSL handshake | Zscaler/corporate network blocks Robinhood TLS | Switch to hotspot or home WiFi, then run the script |
+
+---
+
+## Robinhood session management
+
+The `robin_stocks` library stores the OAuth session in `~/.tokens/robinhood.pickle`.
+Access tokens expire roughly every 24 hours. When expired, the dashboard shows
+`'NoneType' object has no attribute 'get'` because `load_portfolio_profile()` returns None.
+
+### How the dashboard handles it (automatic)
+
+The `_rh_login()` function in both dashboards (port 8502 and 8503) bypasses `rh.login()`
+(which makes a blocking GET to Robinhood that hangs on corporate network) and instead:
+
+1. Loads the pickle directly
+2. Decodes the JWT `exp` field to check if the access token is still valid
+3. If valid → injects it into the session headers without any network call
+4. If expired → calls the `/oauth2/token/` refresh endpoint (POST only — not blocked by Zscaler)
+5. Saves the new access + refresh tokens back to the pickle atomically
+6. Falls back to full `rh.login()` only if refresh also fails
+
+### When automatic refresh fails (full re-auth required)
+
+The OAuth refresh token is single-use and rotates on every refresh. If it gets
+consumed by a failed save (e.g., script interrupted mid-run), the dashboard cannot
+recover automatically.
+
+**Fix: run `rh_reauth.py` on hotspot or home WiFi:**
+```bash
+"/Users/pterzian/Desktop/TVClaude/Portfolio Trading System-RH/venv/bin/python" \
+    /Users/pterzian/Desktop/TVClaude/rh_reauth.py
+```
+
+This will:
+1. Detect the stale pickle and skip it
+2. Do a full username/password login
+3. Prompt you to approve the device in the Robinhood mobile app (push notification)
+4. Save the fresh access + refresh tokens to `~/.tokens/robinhood.pickle`
+
+**Why hotspot?** Zscaler (corporate network) blocks the SSL handshake to
+`api.robinhood.com` during the initial login GET. The refresh endpoint (`/oauth2/token/`
+POST) is NOT blocked — so automatic refresh works on any network, but the first
+login requires a clean SSL connection.
+
+### Do not burn the refresh token
+
+Never call the OAuth refresh endpoint twice in quick succession without saving the
+response first. Robinhood rotates refresh tokens — the first successful call
+invalidates the old token. If you test the call and then try again, the second
+call will fail with `invalid_grant`.
+
+Always refresh in a single atomic script:
+```python
+resp = requests.post("https://api.robinhood.com/oauth2/token/", json={...})
+new = resp.json()
+if "access_token" in new and "refresh_token" in new:
+    data.update(new)
+    pickle.dump(data, open(PICKLE, "wb"))  # save immediately
+```
 
 ---
 
