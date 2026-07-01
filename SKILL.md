@@ -249,6 +249,8 @@ launchctl kickstart -k gui/$(id -u)/com.tvclaude.portfolio.daily
 ---
 
 ## Lessons learned
+- 2026-07-01: Clean daily run. Macro UNKNOWN (score unavailable), no alerts fired; third consecutive day with macro score unresolvable — per prior rule, escalate to explicit error log with timestamp and treat as confirmed data-pipeline failure requiring active investigation.
+- 2026-06-30: Clean daily run. Macro UNKNOWN (score unavailable), no alerts fired; second consecutive day with macro score unresolvable confirms a persistent data-pipeline gap — escalate UNKNOWN macro score to explicit error log with timestamp if it recurs a third consecutive day.
 - 2026-06-29: Clean daily run. Macro UNKNOWN (score unavailable), no alerts fired; system initialized successfully with 2 held positions and 10 watchlist tickers, confirming baseline operation — flag any future runs where macro score remains UNKNOWN as a data-pipeline issue requiring explicit fallback logging.
 
 _Append new entries here after every alert or incident.
