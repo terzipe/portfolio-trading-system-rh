@@ -246,7 +246,6 @@ launchctl kickstart -k gui/$(id -u)/com.tvclaude.portfolio.daily
 | IV alert false-positive during earnings | Normal earnings IV move, not a signal | Flag as expected; suppress unless > 20pp single session |
 | Daily snapshot missing | Previous run crashed before write | Always write snapshot at end of run in finally block |
 | RH Tracker dashboard shows `NoneType has no attribute 'get'` | `robin_stocks login()` returned None — session expired | Run `rh_reauth.py` (see below) |
-| `rh_reauth.py` hangs at SSL handshake | Zscaler/corporate network blocks Robinhood TLS | Switch to hotspot or home WiFi, then run the script |
 
 ---
 
@@ -259,12 +258,12 @@ Access tokens expire roughly every 24 hours. When expired, the dashboard shows
 ### How the dashboard handles it (automatic)
 
 The `_rh_login()` function in both dashboards (port 8502 and 8503) bypasses `rh.login()`
-(which makes a blocking GET to Robinhood that hangs on corporate network) and instead:
+and instead:
 
 1. Loads the pickle directly
 2. Decodes the JWT `exp` field to check if the access token is still valid
 3. If valid → injects it into the session headers without any network call
-4. If expired → calls the `/oauth2/token/` refresh endpoint (POST only — not blocked by Zscaler)
+4. If expired → calls the `/oauth2/token/` refresh endpoint
 5. Saves the new access + refresh tokens back to the pickle atomically
 6. Falls back to full `rh.login()` only if refresh also fails
 
@@ -274,7 +273,7 @@ The OAuth refresh token is single-use and rotates on every refresh. If it gets
 consumed by a failed save (e.g., script interrupted mid-run), the dashboard cannot
 recover automatically.
 
-**Fix: run `rh_reauth.py` on hotspot or home WiFi:**
+**Fix: run `rh_reauth.py`:**
 ```bash
 "/Users/pterzian/Desktop/TVClaude/Portfolio Trading System-RH/venv/bin/python" \
     /Users/pterzian/Desktop/TVClaude/rh_reauth.py
@@ -285,11 +284,6 @@ This will:
 2. Do a full username/password login
 3. Prompt you to approve the device in the Robinhood mobile app (push notification)
 4. Save the fresh access + refresh tokens to `~/.tokens/robinhood.pickle`
-
-**Why hotspot?** Zscaler (corporate network) blocks the SSL handshake to
-`api.robinhood.com` during the initial login GET. The refresh endpoint (`/oauth2/token/`
-POST) is NOT blocked — so automatic refresh works on any network, but the first
-login requires a clean SSL connection.
 
 ### Do not burn the refresh token
 
@@ -310,6 +304,10 @@ if "access_token" in new and "refresh_token" in new:
 ---
 
 ## Lessons learned
+- 2026-07-07: Clean daily run. Macro REDUCED (score: 64.3/100), no alerts fired; score continues to climb above the 60-threshold zone, reinforcing the prior rule that sustained readings above 60 warrant close monitoring for posture escalation toward NORMAL or ELEVATED.
+- 2026-07-06: Clean daily run. Macro REDUCED (score: 56.5/100), no alerts fired; score continues trending upward from 53.8 on 2026-07-02, remaining below the 60 threshold — monitor for sustained breach above 60 across multiple sessions before treating as a posture-shift signal.
+- 2026-07-03: Clean daily run. Macro REDUCED (score: 58.8/100), no alerts fired; macro score continues stable recovery trend following pipeline restoration, with posture now upgraded from REDUCED (53.8) to a firmer REDUCED (58.8) — confirms pipeline stability is holding and warrants continued monitoring until score sustains above 60 across multiple sessions.
+- 2026-07-02: Clean daily run. Macro REDUCED (score: 53.8/100), no alerts fired; macro score resolved successfully after three consecutive UNKNOWN days — confirms data-pipeline recovery, close monitoring warranted to ensure stability persists.
 - 2026-07-01: Clean daily run. Macro UNKNOWN (score unavailable), no alerts fired; third consecutive day with macro score unresolvable — per prior rule, escalate to explicit error log with timestamp and treat as confirmed data-pipeline failure requiring active investigation.
 - 2026-06-30: Clean daily run. Macro UNKNOWN (score unavailable), no alerts fired; second consecutive day with macro score unresolvable confirms a persistent data-pipeline gap — escalate UNKNOWN macro score to explicit error log with timestamp if it recurs a third consecutive day.
 - 2026-06-29: Clean daily run. Macro UNKNOWN (score unavailable), no alerts fired; system initialized successfully with 2 held positions and 10 watchlist tickers, confirming baseline operation — flag any future runs where macro score remains UNKNOWN as a data-pipeline issue requiring explicit fallback logging.
