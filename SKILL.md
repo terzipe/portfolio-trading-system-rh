@@ -304,6 +304,7 @@ if "access_token" in new and "refresh_token" in new:
 ---
 
 ## Lessons learned
+- 2026-07-08: Clean daily run. Macro REDUCED (score: 50.6/100), no alerts fired; score remains in the mid-50s range consistent with recent sessions, confirming sustained REDUCED posture — continue monitoring for meaningful movement above 60 or below 45 as the next actionable threshold.
 - 2026-07-07: Clean daily run. Macro REDUCED (score: 64.3/100), no alerts fired; score continues to climb above the 60-threshold zone, reinforcing the prior rule that sustained readings above 60 warrant close monitoring for posture escalation toward NORMAL or ELEVATED.
 - 2026-07-06: Clean daily run. Macro REDUCED (score: 56.5/100), no alerts fired; score continues trending upward from 53.8 on 2026-07-02, remaining below the 60 threshold — monitor for sustained breach above 60 across multiple sessions before treating as a posture-shift signal.
 - 2026-07-03: Clean daily run. Macro REDUCED (score: 58.8/100), no alerts fired; macro score continues stable recovery trend following pipeline restoration, with posture now upgraded from REDUCED (53.8) to a firmer REDUCED (58.8) — confirms pipeline stability is holding and warrants continued monitoring until score sustains above 60 across multiple sessions.

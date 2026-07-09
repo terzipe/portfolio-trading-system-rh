@@ -2,6 +2,7 @@
 Send an iMessage via AppleScript. macOS only.
 """
 import subprocess
+import sys
 from config import IMESSAGE_RECIPIENT
 
 
@@ -11,4 +12,7 @@ def send_imessage(message: str, recipient: str | None = None):
         print(f"[alerts] iMessage recipient not set — skipping. Message:\n{message}")
         return
     script = f'tell application "Messages" to send "{message}" to buddy "{to}" of (service 1 whose service type is iMessage)'
-    subprocess.run(["osascript", "-e", script], check=True)
+    try:
+        subprocess.run(["osascript", "-e", script], check=True, timeout=30)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        print(f"[alerts] iMessage delivery failed ({exc}) — continuing without crashing the run.", file=sys.stderr)
