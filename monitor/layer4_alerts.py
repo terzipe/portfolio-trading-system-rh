@@ -124,7 +124,12 @@ def render_dashboard(analytics: dict, market: dict, alerts: list[str]):
     print("=" * 70 + "\n")
 
 
-def run(valued_positions: list[dict], analytics: dict, market: dict):
+def run(valued_positions: list[dict], analytics: dict, market: dict, send_alert: bool = True):
+    """
+    send_alert=False skips the built-in iMessage send so a caller (e.g.
+    loop_daily_rh.py) can apply its own suppression rules to `alerts`
+    first and send only what survives — see alerts/imessage.py callers.
+    """
     yesterday = _load_yesterday()
 
     alerts = (
@@ -136,7 +141,7 @@ def run(valued_positions: list[dict], analytics: dict, market: dict):
 
     render_dashboard(analytics, market, alerts)
 
-    if alerts:
+    if alerts and send_alert:
         message = f"RH Tracker Alert {analytics['as_of']}:\n" + "\n".join(alerts)
         send_imessage(message)
 
