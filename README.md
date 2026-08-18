@@ -2,19 +2,25 @@
 
 Robinhood portfolio monitor with Claude AI news analysis and iMessage alerts. Runs daily at 9:00 AM ET, tracks held positions and a watchlist derived from the LS Equity Fund factor model, and fires alerts when targets/stops are hit or macro risk shifts.
 
+This system is a **monitor**, not an execution engine — alerts are advisory. `broker/robinhood.py` can place live orders (see Order Placement below), but nothing here does so automatically; every trade is a manual/explicit call.
+
 ---
 
 ## Architecture
 
 ```
-run_daily.py
+loop_daily_rh.py                (cron entry point — wraps run_daily.py's layers directly)
   │
   ├── Layer 0  universe builder   — live RH positions + top LS Equity LONG picks
   ├── Layer 1  valuation          — prices, Greeks, IV for held positions
   ├── Layer 2  analytics          — P&L, sector allocation, aggregate Greeks
   ├── Layer 3  news / macro       — Claude AI news summary per ticker + regime_trader macro gate
-  └── Layer 4  alerts / dashboard — target/stop checks, IV spikes, iMessage
+  ├── Layer 4  alerts / dashboard — target/stop checks, IV spikes, iMessage
+  ├── SKILL.md suppression filter — drops alerts matched by a known-noisy rule (see below)
+  └── SKILL.md lesson writer      — Claude appends one dated lesson per run
 ```
+
+`run_daily.py` is the same 4-layer pipeline for standalone/manual runs; `loop_daily_rh.py` (in the `TVClaude/` root, one level up) is what the cron actually invokes — it adds the suppression filter and lesson-writing step on top.
 
 Two accounts monitored:
 - **Margin account** `579611880`
@@ -26,18 +32,24 @@ Two accounts monitored:
 
 ### View today's dashboard output
 ```bash
-tail -100 "logs/daily.log"
+tail -100 ~/Library/Logs/TVClaude/daily.log
 ```
 
 ### View errors
 ```bash
-cat "logs/daily.err"
+cat ~/Library/Logs/TVClaude/daily.err
 ```
 
 ### Run manually
 ```bash
 cd "/Users/pterzian/Desktop/TVClaude/Portfolio Trading System-RH"
 venv/bin/python run_daily.py
+```
+
+### Run the full cron pipeline manually (suppression + lesson writer included)
+```bash
+cd /Users/pterzian/Desktop/TVClaude
+"Portfolio Trading System-RH/venv/bin/python" loop_daily_rh.py
 ```
 
 ### Run research (screen tickers and pick contracts)
@@ -50,7 +62,7 @@ venv/bin/python run_research.py
 
 ## Automation
 
-Runs via LaunchAgent at **9:00 AM ET / 6:00 AM PT** on weekdays.
+Runs via LaunchAgent (`com.tvclaude.portfolio.daily`) at **9:00 AM ET / 6:00 AM PT** on weekdays, invoking `loop_daily_rh.py`.
 
 ```bash
 # Check status
@@ -67,8 +79,40 @@ launchctl kickstart -k gui/$(id -u)/com.tvclaude.portfolio.daily
 ```
 
 Logs:
-- `logs/daily.log` — stdout
-- `logs/daily.err` — stderr
+- `~/Library/Logs/TVClaude/daily.log` — stdout
+- `~/Library/Logs/TVClaude/daily.err` — stderr
+
+(Not the local `logs/` directory in this folder — LaunchAgents can't reliably write under `~/Desktop` due to macOS TCC sandboxing, so cron output goes to `~/Library/Logs/TVClaude/` instead. `logs/daily.log` here is a stale leftover from before that move.)
+
+---
+
+## Robinhood Session Management
+
+`robin_stocks` access tokens expire ~24h. `monitor/layer0_universe.py::_rh_login()` handles this without a fresh interactive login on every run:
+
+1. Loads `~/.tokens/robinhood.pickle` and checks the access token's JWT `exp`
+2. If still valid, injects it directly (no network call)
+3. If expired, refreshes via the OAuth `/oauth2/token/` endpoint and saves the rotated tokens back to the pickle
+4. Only falls back to a full `rh.login()` if the refresh token itself is dead — that path triggers Robinhood's device-approval push challenge, which nobody's around to approve on a 9am unattended cron, and will 429-loop and fail
+
+If you see `held: []` in the log for no reason, or a 429 on `get_prompts_status`, the refresh token has died. Fix:
+```bash
+"Portfolio Trading System-RH/venv/bin/python" /Users/pterzian/Desktop/TVClaude/rh_reauth.py
+```
+This does a full login and prompts for a device-approval tap on your phone, then saves a fresh pickle.
+
+---
+
+## Alert Suppression
+
+`loop_daily_rh.py` runs every raw alert from Layer 4 through `_should_suppress_alert()` before sending, using rules read from `SKILL.md`:
+
+| Rule | Suppresses |
+|---|---|
+| `STOP HIT` during `CASH` macro posture | Position should already be closed under CASH posture — alert is noise |
+| `DRAWDOWN STOP` when NAV < $50 | Portfolio too small for the daily-loss-% threshold to mean anything; hypersensitive to single moves |
+
+Suppressed alerts are logged (`[SUPPRESSED] ... — <reason>`) and included in the day's `SKILL.md` lesson, but never sent to iMessage. Add new rules to `_should_suppress_alert()` as noisy patterns are identified.
 
 ---
 
@@ -99,7 +143,26 @@ All settings come from `.env` in the project root:
 | `NEW STRIKE` | Option strike detected that wasn't in yesterday's snapshot |
 | `DRAWDOWN STOP` | Portfolio-level daily loss hits `MAX_DAILY_LOSS_PCT` |
 
-Alerts fire to iMessage via AppleScript and print to the dashboard.
+Alerts fire to iMessage via AppleScript and print to the dashboard (subject to suppression — see above).
+
+---
+
+## Order Placement
+
+`broker/robinhood.py` (`place_equity_order` / `place_option_order` / `cancel_order`) can place live orders on the real (non-paper) Robinhood accounts — nothing in this system calls it automatically, it's there for manual/explicit trades. As written today it always uses `rh.login()` (full username/password, not the pickle-refresh path — see Session Management above) and doesn't expose `account_number`, so it always targets the primary account and can hit the same device-approval-challenge risk on an unattended run.
+
+For a one-off manual close on a specific account, it's simpler to reuse the already-working session directly instead:
+
+```python
+from monitor.layer0_universe import _rh_login, _AGENTIC_ACCOUNT  # or _MARGIN_ACCOUNT
+
+rh = _rh_login()
+rh.order_sell_market("MO", 3, account_number=_AGENTIC_ACCOUNT, timeInForce="gfd")
+```
+
+Two gotchas either way:
+- `order_sell_market`/`order_buy_market` need `timeInForce="gfd"` (good-for-day) — `robin_stocks`' default `"gtc"` gets rejected by Robinhood on market orders (`'Invalid Good Til Canceled order.'`).
+- Pass `account_number=` explicitly for a non-primary account — both `robin_stocks` and `broker/robinhood.py`'s wrapper default to the primary account otherwise.
 
 ---
 
@@ -144,18 +207,19 @@ Snapshots are saved daily to `data/snapshots/YYYY-MM-DD.json` for day-over-day c
 
 ```
 Portfolio Trading System-RH/
-├── run_daily.py          # main entry point (daily cron)
+├── run_daily.py          # 4-layer pipeline, standalone/manual entry point
 ├── run_research.py       # one-time ticker screening + contract picking
 ├── config.py             # env vars, paths, budget constants
+├── SKILL.md              # dated lesson log + alert-suppression rules + session-mgmt notes
 ├── .env                  # credentials (not committed)
 ├── monitor/
-│   ├── layer0_universe.py
+│   ├── layer0_universe.py   # includes _rh_login() pickle-refresh session handling
 │   ├── layer1_valuation.py
 │   ├── layer2_analytics.py
 │   ├── layer3_news.py
 │   └── layer4_alerts.py
 ├── broker/
-│   └── robinhood.py      # RH login wrapper
+│   └── robinhood.py      # RH login + place_equity_order/place_option_order/cancel_order
 ├── research/
 │   ├── screener.py       # Claude-based ticker screening
 │   └── contract_picker.py
@@ -164,7 +228,11 @@ Portfolio Trading System-RH/
 ├── data/
 │   ├── positions/positions.json   # manually maintained holdings
 │   └── snapshots/                 # daily JSON snapshots
-└── logs/
+└── logs/                 # stale — see "Automation" above for the real log path
     ├── daily.log
     └── daily.err
+
+../                        # TVClaude root
+├── loop_daily_rh.py       # cron entry point: wraps run_daily.py + suppression + lessons
+└── rh_reauth.py           # manual full re-auth when the refresh token has died
 ```
