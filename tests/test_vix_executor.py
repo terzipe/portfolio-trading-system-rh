@@ -15,7 +15,7 @@ from monitor.vix_executor import _size_svix_shares, _size_option_contracts, _siz
 from monitor.vix_options import ContractPick
 from monitor.vix_session import SessionResult, HEALTHY, DEAD
 from monitor.vix_signals import (
-    Action, SELL_SVIX_ALL, BUY_SVIX_SHARES, BUY_UVXY_PUT, BUY_VXX_CALL, CLOSE_OPTION,
+    Action, SELL_SVIX_ALL, BUY_SVIX_SHARES, BUY_UVXY_PUT, BUY_VXX_CALL, CLOSE_OPTION, ROLL_OPTION,
 )
 
 
@@ -403,3 +403,144 @@ def test_dead_session_from_429_produces_zero_orders_for_any_proposed_action():
     assert len(outcomes) == 2
     # Confirms the executor never even reaches robin_stocks — session.rh_module
     # is None, so there's no rh object to call order functions on at all.
+
+
+# ── ROLL_OPTION (close old contract, open a fresh one, same quantity) ──
+
+_HELD_UVXY_PUT = {
+    "type": "option", "ticker": "UVXY", "contracts": 3, "cost_basis": 345.0,
+    "mid_price": 1.55, "expiry": "2099-01-15", "strike": 54.0, "option_type": "put",
+}
+_FRESH_PUT_REPLACEMENT = ContractPick(
+    ticker="UVXY", option_type="put", strike=55.0, expiry="2099-02-19", dte=18,
+    bid=1.10, ask=1.20, mid=1.15, delta=-0.32, open_interest=400, fallback=False,
+)
+# Hit live 2026-08-19: pick_put() can return a real contract with bid=ask=0
+# (no real market) on a thin fallback strike — the roll's open leg must
+# refuse this itself since it bypasses _size_and_explain_option() (which
+# is where this same check lives for the regular entry path).
+_ZERO_PREMIUM_REPLACEMENT = ContractPick(
+    ticker="VXX", option_type="put", strike=18.0, expiry="2099-01-15", dte=17,
+    bid=0.0, ask=0.0, mid=0.0, delta=-0.1, open_interest=10, fallback=True,
+)
+
+
+def test_roll_disabled_by_default_is_refused(monkeypatch, tmp_path):
+    monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_ROLL", False)
+
+    rh = MagicMock()
+    session = _healthy_session(rh)
+    action = Action(ROLL_OPTION, "UVXY", "roll candidate: +25%", _HELD_UVXY_PUT)
+
+    outcomes = vix_executor.execute_actions([action], session, nav=10000, sleeve_mv=345, quote_fn=lambda t: 60.0, dry_run=True)
+
+    assert len(outcomes) == 1
+    assert outcomes[0].would_execute is False
+    assert "ENABLE_VIX_AUTO_ROLL=false" in outcomes[0].skip_reason
+    rh.order_sell_option_limit.assert_not_called()
+    rh.order_buy_option_limit.assert_not_called()
+
+
+def test_dry_run_roll_previews_both_legs(monkeypatch, tmp_path):
+    monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_ROLL", True)
+    monkeypatch.setattr(vix_executor.vix_options, "pick_put", lambda spot_price, primary_ticker, fallback_ticker: _FRESH_PUT_REPLACEMENT)
+
+    rh = MagicMock()
+    session = _healthy_session(rh)
+    action = Action(ROLL_OPTION, "UVXY", "roll candidate: +25%", _HELD_UVXY_PUT)
+
+    outcomes = vix_executor.execute_actions([action], session, nav=10000, sleeve_mv=345, quote_fn=lambda t: 60.0, dry_run=True)
+
+    assert len(outcomes) == 2
+    close_leg, open_leg = outcomes
+    assert close_leg.order_preview["call"] == "order_sell_option_limit"
+    assert close_leg.order_preview["quantity"] == 3
+    assert close_leg.order_preview["strike"] == 54.0  # the OLD contract
+    assert open_leg.order_preview["call"] == "order_buy_option_limit"
+    assert open_leg.order_preview["quantity"] == 3  # same quantity, not resized
+    assert open_leg.order_preview["strike"] == 55.0  # the NEW contract
+    assert open_leg.order_preview["expiry"] == "2099-02-19"
+    rh.order_sell_option_limit.assert_not_called()
+    rh.order_buy_option_limit.assert_not_called()
+
+
+def test_roll_stops_after_close_if_no_replacement_found(monkeypatch, tmp_path):
+    monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_ROLL", True)
+    monkeypatch.setattr(vix_executor.vix_options, "pick_put", lambda spot_price, primary_ticker, fallback_ticker: None)
+
+    rh = MagicMock()
+    session = _healthy_session(rh)
+    action = Action(ROLL_OPTION, "UVXY", "roll candidate: +25%", _HELD_UVXY_PUT)
+
+    outcomes = vix_executor.execute_actions([action], session, nav=10000, sleeve_mv=345, quote_fn=lambda t: 60.0, dry_run=True)
+
+    assert len(outcomes) == 2
+    assert outcomes[0].would_execute is True  # close leg still previewed
+    assert outcomes[1].would_execute is False
+    assert "flat on this leg, not doubled" in outcomes[1].skip_reason
+
+
+def test_roll_refuses_zero_premium_replacement_not_doubled_or_stuck(monkeypatch, tmp_path):
+    monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_ROLL", True)
+    monkeypatch.setattr(vix_executor.vix_options, "pick_put", lambda spot_price, primary_ticker, fallback_ticker: _ZERO_PREMIUM_REPLACEMENT)
+
+    rh = MagicMock()
+    session = _healthy_session(rh)
+    action = Action(ROLL_OPTION, "UVXY", "roll candidate: +25%", _HELD_UVXY_PUT)
+
+    outcomes = vix_executor.execute_actions([action], session, nav=10000, sleeve_mv=345, quote_fn=lambda t: 60.0, dry_run=True)
+
+    assert len(outcomes) == 2
+    assert outcomes[0].would_execute is True  # close leg still previewed
+    assert outcomes[1].would_execute is False
+    assert "no real market" in outcomes[1].skip_reason
+    assert "not doubled" in outcomes[1].skip_reason
+    rh.order_buy_option_limit.assert_not_called()
+
+
+def test_live_roll_calls_both_legs_with_option_order_polling(monkeypatch, tmp_path):
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", state_file)
+    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_ROLL", True)
+    monkeypatch.setattr(vix_executor.vix_options, "pick_put", lambda spot_price, primary_ticker, fallback_ticker: _FRESH_PUT_REPLACEMENT)
+
+    rh = MagicMock()
+    rh.order_sell_option_limit.return_value = {"id": "close-roll-1"}
+    rh.order_buy_option_limit.return_value = {"id": "open-roll-1"}
+    rh.get_option_order_info.return_value = {"state": "confirmed"}
+    session = _healthy_session(rh)
+    action = Action(ROLL_OPTION, "UVXY", "roll candidate: +25%", _HELD_UVXY_PUT)
+
+    outcomes = vix_executor.execute_actions([action], session, nav=10000, sleeve_mv=345, quote_fn=lambda t: 60.0, dry_run=False)
+
+    assert len(outcomes) == 2
+    assert outcomes[0].executed is True
+    assert outcomes[1].executed is True
+    rh.order_sell_option_limit.assert_called_once_with(
+        "close", "credit", 1.55, "UVXY", 3, "2099-01-15", 54.0, "put",
+        account_number=vix_executor._account_number(), timeInForce="gfd",
+    )
+    rh.order_buy_option_limit.assert_called_once_with(
+        "open", "debit", 1.20, "UVXY", 3, "2099-02-19", 55.0, "put",
+        account_number=vix_executor._account_number(), timeInForce="gfd",
+    )
+    # Both legs are options — must poll get_option_order_info for both,
+    # never get_stock_order_info.
+    assert rh.get_option_order_info.call_count == 2
+    rh.get_stock_order_info.assert_not_called()
+
+
+def test_roll_requires_healthy_session_not_just_flatten_eligible(monkeypatch):
+    from monitor.vix_session import DEGRADED  # not exported alongside HEALTHY/DEAD above
+    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_ROLL", True)
+    degraded_session = SessionResult(state=DEGRADED, reason="soft error", rh_module=MagicMock())
+    action = Action(ROLL_OPTION, "UVXY", "roll candidate: +25%", _HELD_UVXY_PUT)
+
+    outcomes = vix_executor.execute_actions([action], degraded_session, nav=10000, sleeve_mv=345, quote_fn=lambda t: 60.0, dry_run=True)
+
+    assert outcomes[0].would_execute is False
+    assert "!= HEALTHY" in outcomes[0].skip_reason

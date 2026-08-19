@@ -25,6 +25,7 @@ from datetime import date, datetime
 from config import (
     VIX_ACCOUNT, VIX_STATE_FILE, VIX_SLEEVE_MAX_PCT, VIX_SVIX_MAX_PCT,
     VIX_MAX_CONTRACTS, VIX_KILL_SWITCH, ENABLE_VIX_AUTO_SELL, ENABLE_VIX_AUTO_BUY,
+    ENABLE_VIX_AUTO_ROLL,
 )
 from monitor import vix_options
 from monitor.layer0_universe import _AGENTIC_ACCOUNT, _MARGIN_ACCOUNT
@@ -323,7 +324,37 @@ def execute_actions(
             continue
 
         if is_roll:
-            outcomes.append(ExecutionOutcome(action, False, skip_reason="ROLL_OPTION requires ENABLE_VIX_AUTO_ROLL — not implemented in scaffold, alert only"))
+            if not ENABLE_VIX_AUTO_ROLL:
+                outcomes.append(ExecutionOutcome(action, False, skip_reason="ENABLE_VIX_AUTO_ROLL=false"))
+                continue
+            # A roll's second leg opens new risk (a fresh contract), so it
+            # needs the same HEALTHY bar as any other entry — not just the
+            # looser HEALTHY-or-DEGRADED bar that flatten-only actions get.
+            if not can_buy(session):
+                outcomes.append(ExecutionOutcome(action, False, skip_reason=f"session {session.state} != HEALTHY, no rolls (second leg opens new risk)"))
+                continue
+            if orders_this_cycle + 2 > _MAX_ORDERS_PER_CYCLE:
+                outcomes.append(ExecutionOutcome(action, False, skip_reason="roll needs up to 2 orders (close+open); cycle budget would be exceeded"))
+                continue
+
+            roll_price = quote_fn(action.ticker) if action.ticker else None
+            roll_outcomes = _execute_roll(rh, action, account_number, roll_price, dry_run=dry_run)
+            outcomes.extend(roll_outcomes)
+            orders_this_cycle += sum(1 for o in roll_outcomes if o.executed or o.would_execute)
+
+            last_leg = roll_outcomes[-1]
+            if last_leg.executed:
+                confirmed = _poll_order_confirmed(rh, last_leg.order_id, is_option=True)
+                if not confirmed:
+                    outcomes[-1].skip_reason = "roll open leg unconfirmed — stopping cycle, no further orders"
+                    break
+            elif not dry_run and any(o.executed for o in roll_outcomes):
+                # Close leg went through live but the open leg was refused
+                # or failed for a real reason (no liquid replacement, etc.)
+                # — sleeve is now flat on this leg, not doubled. Stop the
+                # cycle rather than risk stacking further orders on top of
+                # an already-eventful one.
+                break
             continue
 
     return outcomes
@@ -432,3 +463,105 @@ def _execute_entry(
         return ExecutionOutcome(action, False, skip_reason="unrecognized entry action")
     except Exception as exc:  # noqa: BLE001
         return ExecutionOutcome(action, False, skip_reason=f"order failed: {exc}")
+
+
+def _roll_entry_action_for(contract) -> str:
+    """Map a freshly-picked ContractPick back to the BUY_* constant
+    _execute_entry() dispatches on. _execute_entry()'s option branch
+    doesn't actually discriminate by ticker within that branch (it reads
+    contract.ticker for the real order symbol), so any of the 4 constants
+    would work mechanically — this just keeps the Action/outcome's own
+    `.action` label semantically honest for logs and the dashboard."""
+    if contract.option_type == "put":
+        return BUY_UVXY_PUT if contract.ticker == "UVXY" else BUY_VXX_PUT
+    return BUY_UVXY_CALL if contract.ticker == "UVXY" else BUY_VXX_CALL
+
+
+def _execute_roll(
+    rh, action: Action, account_number: str, spot_price: float | None, dry_run: bool = False,
+) -> list[ExecutionOutcome]:
+    """
+    Roll = close the existing contract, then open a similar contract in a
+    fresh DTE window at the same quantity (SRS §9: "+25% roll candidate").
+    Two-leg, sequential, and conservative by construction:
+      - The open leg is only attempted after the close leg is confirmed
+        (live) or would-execute (dry-run) — never risks holding both the
+        old and new contract at once.
+      - If the close leg fails/is refused, stop — no open leg at all.
+      - If the close leg goes through but no liquid replacement contract
+        exists, stop — the position is now flat on this leg (not doubled,
+        not stuck), and that is reported explicitly rather than silently.
+      - Quantity is preserved 1:1 from the closed position — a roll
+        refreshes an existing position, it does not resize it, so this
+        does not re-run sleeve %/VIX_MAX_CONTRACTS sizing (a same-size
+        replacement cannot increase net exposure beyond what was already
+        held and already passed those checks on entry).
+    Returns 1 outcome (close only) if the roll stops after leg 1, or 2
+    outcomes (close + open) if it proceeds to leg 2.
+    """
+    pos = action.position
+    if not pos:
+        return [ExecutionOutcome(action, False, skip_reason="no position attached to roll action")]
+
+    ticker = pos.get("ticker")
+    option_type = pos.get("option_type")
+    quantity = pos.get("contracts", 0)
+    if not quantity or quantity <= 0:
+        return [ExecutionOutcome(action, False, skip_reason="no contracts to roll")]
+
+    close_action = Action(CLOSE_OPTION, ticker, action.reason, pos)
+    close_outcome = _execute_flatten(rh, close_action, account_number, dry_run=dry_run)
+    outcomes = [close_outcome]
+
+    if not (close_outcome.executed or close_outcome.would_execute):
+        return outcomes  # couldn't even preview/submit the close leg — stop here
+
+    if close_outcome.executed and not dry_run:
+        confirmed = _poll_order_confirmed(rh, close_outcome.order_id, is_option=True)
+        if not confirmed:
+            outcomes[0].skip_reason = "roll close leg unconfirmed — stopping before opening the new leg"
+            return outcomes
+
+    if option_type == "put":
+        if spot_price is None or spot_price <= 0:
+            outcomes.append(ExecutionOutcome(action, False, skip_reason=f"closed old contract, but no spot price for {ticker} to pick a replacement put"))
+            return outcomes
+        other_ticker = "VXX" if ticker == "UVXY" else "UVXY"
+        new_contract = vix_options.pick_put(spot_price=spot_price, primary_ticker=ticker, fallback_ticker=other_ticker)
+    elif option_type == "call":
+        new_contract = vix_options.pick_call(ticker=ticker)
+    else:
+        outcomes.append(ExecutionOutcome(action, False, skip_reason=f"closed old contract, but unrecognized option_type {option_type!r} to roll into"))
+        return outcomes
+
+    if new_contract is None:
+        outcomes.append(ExecutionOutcome(
+            action, False,
+            skip_reason="closed old contract, but found no liquid replacement — sleeve is now flat on this leg, not doubled",
+        ))
+        return outcomes
+
+    if new_contract.mid <= 0:
+        # Same "no real market" edge case _size_and_explain_option() guards
+        # on the regular entry path (hit live 2026-08-19 on a thin VXX put)
+        # — the roll bypasses that function entirely (quantity is preserved
+        # 1:1, not re-sized), so it needs its own check here or it would
+        # submit a limit order at price=0.0.
+        outcomes.append(ExecutionOutcome(
+            action, False,
+            skip_reason=(
+                f"closed old contract, but the replacement {new_contract.ticker} {new_contract.expiry} "
+                f"{new_contract.strike}{new_contract.option_type[0]} has no real market "
+                f"(bid=${new_contract.bid:.2f}, ask=${new_contract.ask:.2f}) — sleeve is now flat on this "
+                f"leg, not doubled and not stuck holding a worthless order"
+            ),
+        ))
+        return outcomes
+
+    open_action = Action(_roll_entry_action_for(new_contract), new_contract.ticker, action.reason)
+    open_outcome = _execute_entry(
+        rh, open_action, account_number, spot_price,
+        quantity=quantity, contract=new_contract, dry_run=dry_run,
+    )
+    outcomes.append(open_outcome)
+    return outcomes
