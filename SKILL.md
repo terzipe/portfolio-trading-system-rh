@@ -408,6 +408,8 @@ already; see root repo git history for the fix).
   returns.
 
 ### VIX Trader — Lessons learned
+- 2026-08-19: posture=SVIX_ON, VIX=17.7, session=HEALTHY, actions=1, executed=0, paper_signals=12
+- 2026-08-19: posture=SVIX_ON, VIX=17.73, session=HEALTHY, actions=1, executed=0, paper_signals=9
 - 2026-08-19: posture=SVIX_ON, VIX=17.77, session=HEALTHY, actions=1, executed=1, paper_signals=8
 - 2026-08-19: posture=SVIX_ON, VIX=17.77, session=HEALTHY, actions=1, executed=0, paper_signals=7
 - 2026-08-19: posture=FLATTEN_SVIX, VIX=17.77, session=HEALTHY, actions=1, executed=1, paper_signals=5

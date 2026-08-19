@@ -78,3 +78,36 @@ def fetch_positions(rh) -> list[dict]:
         })
 
     return out
+
+
+def unrealized_pnl(positions: list[dict]) -> dict:
+    """
+    Unrealized P&L on current holdings, scoped to shares (SVIX) only —
+    option positions' pnl_pct is always None above (no live option mark
+    wired yet), so option unrealized P&L isn't reliably computable until
+    that gap is closed. Shared by both loop_daily_vix.py and
+    loop_intraday_vix.py so the calculation lives in exactly one place.
+    """
+    total_dollars = 0.0
+    total_cost = 0.0
+    by_ticker: dict[str, dict] = {}
+    for p in positions:
+        if p.get("type") != "share":
+            continue
+        qty = p.get("quantity", 0)
+        cost = p.get("cost_basis", 0)
+        mid = p.get("mid_price")
+        if mid is None or qty <= 0:
+            continue
+        dollars = (mid - cost) * qty
+        total_dollars += dollars
+        total_cost += cost * qty
+        by_ticker[p["ticker"]] = {
+            "dollars": dollars, "pct": (mid / cost - 1) if cost else None,
+            "quantity": qty, "cost_basis": cost, "mid_price": mid,
+        }
+    return {
+        "total_dollars": total_dollars,
+        "total_pct": (total_dollars / total_cost) if total_cost else None,
+        "by_ticker": by_ticker,
+    }

@@ -27,14 +27,15 @@ class PaperRow:
     session_state: str
     live_executed: bool
     skip_reason: str = ""
+    quantity: Optional[float] = None  # shares or contracts, from the order preview when one exists
     family_tags: dict = field(default_factory=dict)  # SRS §15.3 — reference only, no live orders
 
     def as_dict(self) -> dict:
         return {
             "timestamp": self.timestamp, "posture": self.posture, "action": self.action,
-            "ticker": self.ticker, "price": self.price, "session_state": self.session_state,
-            "live_executed": self.live_executed, "skip_reason": self.skip_reason,
-            "family_tags": self.family_tags,
+            "ticker": self.ticker, "quantity": self.quantity, "price": self.price,
+            "session_state": self.session_state, "live_executed": self.live_executed,
+            "skip_reason": self.skip_reason, "family_tags": self.family_tags,
         }
 
 
@@ -46,6 +47,7 @@ def record(
     session_state: str,
     live_executed: bool,
     skip_reason: str = "",
+    quantity: float | None = None,
     family_tags: dict | None = None,
 ) -> None:
     """Append one row. Called every intraday cycle for every signal computed,
@@ -55,7 +57,7 @@ def record(
         timestamp=datetime.now().isoformat(),
         posture=posture, action=action, ticker=ticker, price=price,
         session_state=session_state, live_executed=live_executed,
-        skip_reason=skip_reason, family_tags=family_tags or {},
+        skip_reason=skip_reason, quantity=quantity, family_tags=family_tags or {},
     )
     with open(VIX_PAPER_LEDGER_FILE, "a") as f:
         f.write(json.dumps(row.as_dict()) + "\n")
