@@ -304,6 +304,23 @@ if "access_token" in new and "refresh_token" in new:
 ---
 
 ## Lessons learned
+- 2026-08-18: Clean daily run. Macro REDUCED (score: 56.0/100), no alerts fired; score remains in the 53–57 range for the second confirmed post-recovery session, suggesting the pipeline is stable but macro posture continues to warrant a cautious reduced stance until the score sustains above 60 across multiple sessions.
+- 2026-08-17: Clean daily run. Macro REDUCED (score: 64.5/100), no alerts fired; score remains comfortably above the 60-threshold boundary, continuing the stable REDUCED posture streak first established after pipeline recovery — no action required.
+- 2026-08-14: Clean daily run. Macro REDUCED (score: 69.3/100), no alerts fired; score remains well above the 60-point threshold with 1 held position and 10 watchlist tickers monitored — confirms stable system operation, though the elevated REDUCED posture warrants continued attention if the score climbs toward NEUTRAL or higher in coming sessions.
+- 2026-08-13: Clean daily run. Macro REDUCED (score: 66.1/100), no alerts fired; score remains above 60 for a sustained period, confirming the data-pipeline recovery noted 2026-07-02 is stable — continue monitoring for any drift back toward UNKNOWN or threshold crossings that could trigger alerts.
+- 2026-08-12: Clean daily run. Macro REDUCED (score: 62.6/100), no alerts fired; score remains above 60 for a sustained period, confirming the REDUCED posture threshold rule — continue monitoring for any drift toward NEUTRAL or escalation toward RISK-OFF.
+- 2026-08-11: 2026-08-11: Drawdown stop triggered at -5.9% daily P&L against a -5.0% limit under REDUCED macro posture (score 61.9/100), with no news context available to explain the move → confirms the drawdown stop rule is functional and should be treated as a hard exit signal regardless of macro posture; when news is unavailable during a loss-limit breach, assume worst-case and do not re-enter until next session with a clean macro read.
+- 2026-08-10: Clean daily run. Macro REDUCED (score: 63.7/100), no alerts fired; score remains firmly in REDUCED territory, continuing the upward trend from prior sessions — confirms prior rule that sustained scores above 60 warrant ongoing close monitoring for posture escalation signals.
+- 2026-08-07: Clean daily run. Macro REDUCED (score: 61.3/100), no alerts fired; score has now crossed and held above 60 for the first time since pipeline recovery, consistent with the existing rule that REDUCED posture warrants close monitoring when it sustains above 60 across multiple sessions.
+- 2026-08-06: Clean daily run. Macro REDUCED (score: 59.2/100), no alerts fired; score remains just below the 60-threshold boundary for a second observed instance — confirm existing rule that REDUCED posture persists until score sustains above 60 across multiple sessions.
+- 2026-08-05: Clean daily run. Macro REDUCED (score: 54.8/100), no alerts fired; score remains stable in the low-to-mid 50s range across multiple sessions, consistent with a sustained REDUCED posture — no rule changes warranted.
+- 2026-08-04: Clean daily run. Macro REDUCED (score: 60.4/100), no alerts fired; score remains above the 60-point REDUCED threshold for a sustained period, reinforcing the rule that REDUCED posture warrants continued defensive positioning until score retreats meaningfully below 60.
+- 2026-08-03: Clean daily run. Macro REDUCED (score: 57.7/100), no alerts fired; score remains below the 60 threshold, continuing the REDUCED posture pattern first established 2026-07-02 — monitor for a sustained cross above 60 before considering posture upgrade.
+- 2026-07-31: Clean daily run. Macro REDUCED (score: 51.3/100), no alerts fired; score remains in the 51–54 range seen on 2026-07-02, suggesting a persistently cautious but stable macro environment — worth monitoring whether REDUCED posture becomes the sustained baseline or drifts toward NEUTRAL if score climbs above 60.
+- 2026-07-30: Clean daily run. Macro DEFENSIVE (score: 44.4/100), no alerts fired; first session recorded at DEFENSIVE posture — monitor whether score continues declining toward stronger defensive thresholds or stabilizes, as sustained sub-50 readings may warrant reviewing watchlist entry criteria.
+- 2026-07-29: 2026-07-29: Macro DEFENSIVE (43.4/100); BBAI stop hit at -30.7% and portfolio P&L breached the -5.0% daily loss limit (-6.4%), but the drawdown stop alert was suppressed due to NAV below the $50 threshold — confirms the NAV guard is functioning as designed, though the combination of a single position drawdown of this magnitude with a defensive macro posture warrants reviewing position sizing rules to prevent outsized single-ticker losses from dominating a small-NAV portfolio.
+- 2026-07-28: Clean daily run. Macro DEFENSIVE (score: 45.6/100); DRAWDOWN STOP fired on portfolio P&L of -8.6% breaching the -5.0% daily loss limit, but was suppressed due to NAV ($27) falling below the $50 minimum threshold — confirm that sub-threshold NAV suppression is working as designed, and flag for manual review whether the account requires recapitalization before normal risk controls can resume.
+- 2026-07-27: Clean daily run. Macro REDUCED (score: 50.1/100), DRAWDOWN STOP triggered on portfolio P&L of -11.2% breaching the -5.0% daily loss limit, but alert was suppressed because NAV ($27) fell below the $50 minimum threshold — confirm that sub-threshold NAV suppression is intentional circuit-breaker behavior and document whether manual review is still required when both conditions fire simultaneously.
 - 2026-07-24: Clean daily run. Macro DEFENSIVE (score: 43.0/100), DRAWDOWN STOP triggered at -10.5% portfolio P&L (exceeding -5.0% daily limit) but was suppressed because NAV ($27) fell below the $50 minimum threshold — confirm that NAV floor suppression logic is working as designed, but flag the underlying -10.5% drawdown as a critical condition requiring manual review even when automated stops are inactive.
 - 2026-07-16: Clean daily run. Macro REDUCED (score: 53.3/100), no alerts fired; score remains stable in the low-50s range across consecutive sessions, confirming pipeline recovery holds and reinforcing that REDUCED posture at this level produces no actionable signals without additional triggers.
 - 2026-07-15: Clean daily run. Macro REDUCED (score: 51.1/100), no alerts fired; score remains in the 51–54 band seen across recent sessions, continuing to confirm stable REDUCED posture without approaching the NEUTRAL threshold — no action warranted unless score sustains above 60 across multiple sessions.
@@ -326,3 +343,66 @@ Format: `YYYY-MM-DD: what happened → what rule was added or changed`._
 _(No entries yet — this file was initialized 2026-06-29. First entry should be
 appended after the next daily run. Include: macro posture, alerts fired, whether
 they were actionable, and any news that mattered.)_
+
+---
+
+## VIX Trader BOT (SRS v1.4)
+
+A separate sleeve on the **Agentic** account (`725024723`) only — SVIX / VXX / UVXY.
+Uses Unusual Whales (Basic tier) for all market data, never yfinance. Driven by
+`loop_daily_vix.py` (9:00 AM ET) and `loop_intraday_vix.py` (15-min RTH worker).
+Lessons for this sleeve go under **"VIX Trader — Lessons learned"** below, *not*
+the equity "Lessons learned" section above — do not let `write_lesson.py` or any
+lesson writer cross-contaminate the two (this bit `regime_trader/SKILL.md` once
+already; see root repo git history for the fix).
+
+### Rules the alert/lesson pipeline must respect
+
+- **Flatten-on-25 is intentional, not noise.** `VIX >= VIX_SPIKE_LEVEL` (default 25)
+  or confirmed backwardation always produces a `FLATTEN_SVIX` posture and, if
+  `ENABLE_VIX_AUTO_SELL=true` and the session is HEALTHY/DEGRADED-with-shadow-book,
+  an actual market sell. Never suppress this alert.
+- **Suppress duplicate roll prompts.** An option roll candidate (`+25%` premium)
+  should not re-alert more than once per 4 hours unless P&L moved >= 10pp since the
+  last prompt. (Documented; not yet implemented — `monitor/vix_alerts.py` currently
+  only carries the auto-buy-skip rule below.)
+- **Suppress auto-buy-skip noise.** A proposed `BUY_*` action rejected purely because
+  `ENABLE_VIX_AUTO_BUY=false` is suppressed from iMessage (still printed/logged and
+  still recorded in `dashboard_cache.json`/`paper_ledger.jsonl`) —
+  `monitor/vix_alerts.py::should_suppress()`. This is the expected, intentional state
+  during the Phase T phased rollout (week-1 all flags off, week-2 sell-only, week-3+
+  buys enabled), so alerting on it every cycle the posture wants to buy would just be
+  daily noise until the flag is deliberately flipped. `ENABLE_VIX_AUTO_SELL=false`
+  skips are **not** suppressed by this rule — that flag is expected to stay on once
+  enabled, so it going false is itself worth surfacing. First observed live 2026-08-19:
+  daily batch proposed `BUY_SVIX_SHARES` (posture=SVIX_ON) and correctly alerted on
+  the skip before this rule existed — this rule was added directly in response to that.
+- **429 / empty `held` / `BOOK_MISMATCH` → reauth, never retry.** If `vix_session.py`
+  reports DEAD, the correct response is one iMessage asking for `rh_reauth.py` — never
+  loop the login or retry the order. `held: []` is only trustworthy after the full
+  `session_ok()` checklist passes; before that, it is not proof of a flat book.
+- **Flatten-needed-but-DEAD is an action item, not a suppressed alert.** If the
+  posture says `FLATTEN_SVIX` but the session is DEAD, that must always reach
+  iMessage — this is the one case where "the bot couldn't act" is itself the
+  urgent news, not something to file away quietly.
+- **Lesson format:** `date, posture, VIX, session state, action, live vs paper delta`
+  — one line, written only by the daily batch (not every 15-minute cycle).
+
+### Session-management notes specific to this sleeve
+
+- `monitor/vix_session.py` deliberately does **not** call
+  `monitor.layer0_universe._rh_login()` — that function's own fallback path calls a
+  full interactive `rh.login()` when the refresh token is dead, which is exactly what
+  Impl Plan §2A forbids for unattended VIX loops. `vix_session.py` re-implements only
+  the safe pickle-load + single-refresh-attempt portion and reports DEAD instead of
+  falling through to a full login. If you ever see a device-approval push fire from
+  the VIX loops, that's a bug in this design, not expected behavior — full interactive
+  login stays exclusively in `rh_reauth.py`, run by a human.
+- Similarly, `monitor/vix_executor.py` does **not** use `broker/robinhood.py` for
+  option orders, even though the original implementation plan text suggested it —
+  that module's `login()` always does a full `rh.login()`. The executor places every
+  order directly on the already-authenticated `rh` session object `vix_session.assess()`
+  returns.
+
+### VIX Trader — Lessons learned
+- 2026-08-19: posture=SVIX_ON, VIX=18.23, session=HEALTHY, actions=1, executed=0, paper_signals=1

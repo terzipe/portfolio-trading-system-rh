@@ -6,3 +6,10 @@ numpy>=1.26.0
 scipy>=1.13.0
 requests>=2.31.0
 python-dotenv>=1.0.0
+
+# VIX Trader BOT (SRS v1.4)
+google-api-python-client>=2.140.0
+google-auth>=2.34.0
+google-auth-oauthlib>=1.2.1
+pytest>=8.3.0
+websocket-client>=1.8.0    # only used if UW_HAS_WEBSOCKET=true

@@ -8,3 +8,10 @@ data/positions/positions.json
 logs/
 *.log
 *.err
+
+# VIX Trader BOT runtime state — see data/vix/ (dir tracked via .gitkeep,
+# contents are per-machine session/paper state, not source)
+data/vix/*.json
+data/vix/*.jsonl
+!data/vix/.gitkeep
+.pytest_cache/

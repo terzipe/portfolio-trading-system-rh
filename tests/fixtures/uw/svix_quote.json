@@ -1,0 +1,55 @@
+{
+  "data": {
+    "last_trade": {
+      "price": "26.1",
+      "time": 1787091365501,
+      "vol": 1453736
+    },
+    "market_time": "postmarket",
+    "quote": {
+      "ask": {
+        "price": "0.000",
+        "size": 0
+      },
+      "bid": {
+        "price": "0.000",
+        "size": 0
+      },
+      "time": 1787097600133
+    },
+    "quote_statistics": {
+      "postmarket": {
+        "midpoint_changes": 118,
+        "quote_changes": 165,
+        "size_only_changes": 47,
+        "spread_tightened": 57,
+        "spread_unchanged": 47,
+        "spread_widened": 61
+      },
+      "premarket": {
+        "midpoint_changes": 430,
+        "quote_changes": 1183,
+        "size_only_changes": 753,
+        "spread_tightened": 224,
+        "spread_unchanged": 753,
+        "spread_widened": 206
+      },
+      "regular": {
+        "midpoint_changes": 13316,
+        "quote_changes": 125207,
+        "size_only_changes": 111891,
+        "spread_tightened": 6671,
+        "spread_unchanged": 111891,
+        "spread_widened": 6645
+      }
+    },
+    "quote_values": {
+      "midpoint": "0",
+      "quote_age_ms": 13562686,
+      "size_imbalance": null,
+      "size_weighted_midpoint": null,
+      "spread": "0.000",
+      "spread_bps": null
+    }
+  }
+}
