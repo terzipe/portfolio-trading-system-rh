@@ -365,8 +365,10 @@ already; see root repo git history for the fix).
   an actual market sell. Never suppress this alert.
 - **Suppress duplicate roll prompts.** An option roll candidate (`+25%` premium)
   should not re-alert more than once per 4 hours unless P&L moved >= 10pp since the
-  last prompt. (Documented; not yet implemented — `monitor/vix_alerts.py` currently
-  only carries the auto-buy-skip rule below.)
+  last prompt — `monitor/vix_alerts.py::should_suppress_roll()`, keyed by
+  ticker/expiry/strike/option_type in `data/vix/roll_alert_state.json`. Only applies
+  to the alert-only case; an executed roll (`ENABLE_VIX_AUTO_ROLL=true`) is real news
+  every time and is never routed through this suppression.
 - **Suppress auto-buy-skip noise.** A proposed `BUY_*` action rejected purely because
   `ENABLE_VIX_AUTO_BUY=false` is suppressed from iMessage (still printed/logged and
   still recorded in `dashboard_cache.json`/`paper_ledger.jsonl`) —
@@ -406,5 +408,11 @@ already; see root repo git history for the fix).
   returns.
 
 ### VIX Trader — Lessons learned
+- 2026-08-19: Manual flatten via the dashboard "Flatten SVIX now" button — sold 2 SVIX shares, order
+  filled instantly at $26.695/share (order id 6a85ee4d...), confirmed flat via a fresh positions fetch.
+  First real order ever placed through any of this bot's infrastructure — proves session reuse, account
+  targeting (Agentic 725024723), and timeInForce=gfd all work correctly against live Robinhood. Went
+  through the dashboard's manual button path, not vix_executor.py's automated _execute_flatten() — same
+  order-call shape, but not literally the same code path firing on its own.
 - 2026-08-19: posture=SVIX_ON, VIX=18.23, session=HEALTHY, actions=1, executed=0, paper_signals=2
 - 2026-08-19: posture=SVIX_ON, VIX=18.23, session=HEALTHY, actions=1, executed=0, paper_signals=1
