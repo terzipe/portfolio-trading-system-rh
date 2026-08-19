@@ -1,19 +1,17 @@
 """
-VIX Trader BOT — order executor (SRS v1.4 §8.5, §9, Impl Plan §6).
+VIX Trader BOT — order executor (SRS v1.4 §8.5, §9, Impl Plan §6), migrated
+from Robinhood to Alpaca paper trading. Every order here is placed directly
+on the already-authenticated `client` (an alpaca.trading.client.TradingClient)
+that vix_session.assess() returns. Alpaca has no "AGENTIC"/"MARGIN"
+sub-account split (one paper account per API key pair), so account routing
+is gone — every RH account_number= kwarg is simply dropped.
 
-Deliberately does NOT use broker/robinhood.py for options, contrary to the
-implementation plan's literal suggestion ("use the path that already works
-in broker/robinhood.py"). broker/robinhood.py's login() always calls a
-full rh.login(username, password) — every one of its functions triggers
-that on first use in a process. That is exactly the device-approval-
-challenge risk SRS §8.3 forbids in unattended loops ("Unattended loops
-must not call full rh.login()"), and RH Tracker's own README already flags
-this as broker/robinhood.py's known limitation. Instead, every order here
-is placed directly on the already-authenticated `rh` module object that
-vix_session.assess() returns (same pattern the RH README recommends for
-manual equity orders) — confirmed both order_*_market and
-order_*_option_limit accept account_number= and timeInForce= directly in
-the installed robin_stocks version.
+Options are submitted via OCC symbol (e.g. "UVXY260115P00054000"), built
+from the ContractPick/held-position's ticker+expiry+strike+option_type.
+Alpaca's limit_price is dollars-per-share (standard options quoting, same
+as contract.bid/ask from vix_options.py) — NOT the $/contract convention
+vix_positions.py uses for cost_basis/mid_price, so closing/rolling a held
+option position must divide by 100 before building the limit order.
 """
 from __future__ import annotations
 
@@ -22,28 +20,31 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime
 
+from alpaca.trading.enums import OrderSide, OrderStatus, TimeInForce
+from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+
 from config import (
-    VIX_ACCOUNT, VIX_STATE_FILE, VIX_SLEEVE_MAX_PCT, VIX_SVIX_MAX_PCT,
+    VIX_STATE_FILE, VIX_SLEEVE_MAX_PCT, VIX_SVIX_MAX_PCT,
     VIX_MAX_CONTRACTS, VIX_KILL_SWITCH, ENABLE_VIX_AUTO_SELL, ENABLE_VIX_AUTO_BUY,
     ENABLE_VIX_AUTO_ROLL,
 )
 from monitor import vix_options
-from monitor.layer0_universe import _AGENTIC_ACCOUNT, _MARGIN_ACCOUNT
 from monitor.vix_session import SessionResult, HEALTHY, can_flatten, can_buy
 from monitor.vix_signals import (
     Action, SELL_SVIX_ALL, BUY_SVIX_SHARES, BUY_UVXY_PUT, BUY_VXX_PUT,
     BUY_VXX_CALL, BUY_UVXY_CALL, ROLL_OPTION, CLOSE_OPTION, HOLD, NOOP,
 )
 
-_ACCOUNT_NUMBERS = {"AGENTIC": _AGENTIC_ACCOUNT, "MARGIN": _MARGIN_ACCOUNT}
 _MAX_ORDERS_PER_CYCLE = 3
-_TIME_IN_FORCE = "gfd"
+_TIME_IN_FORCE = TimeInForce.DAY
+_CONFIRMED_STATUSES = {OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED, OrderStatus.NEW, OrderStatus.ACCEPTED, OrderStatus.PENDING_NEW}
+_TERMINAL_REJECTED_STATUSES = {OrderStatus.REJECTED, OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.STOPPED, OrderStatus.SUSPENDED}
 
 
 @dataclass
 class ExecutionOutcome:
     action: Action
-    executed: bool                        # True only if a real order was submitted to Robinhood
+    executed: bool                        # True only if a real order was submitted to Alpaca
     would_execute: bool = False           # True if every gating check passed (live or dry-run)
     order_preview: dict | None = None     # the exact call args that were/would be sent
     dry_run: bool = False
@@ -52,8 +53,14 @@ class ExecutionOutcome:
     skip_reason: str = ""
 
 
-def _account_number() -> str:
-    return _ACCOUNT_NUMBERS.get(VIX_ACCOUNT, _AGENTIC_ACCOUNT)
+def _occ_symbol(ticker: str, expiry: str, strike: float, option_type: str) -> str:
+    """Build an OCC-format option symbol, e.g. ('UVXY','2026-01-15',54.0,'put')
+    -> 'UVXY260115P00054000'. Inverse of vix_positions._parse_occ_symbol."""
+    exp_date = datetime.strptime(expiry, "%Y-%m-%d")
+    date_part = exp_date.strftime("%y%m%d")
+    cp = "C" if option_type == "call" else "P"
+    strike_part = f"{round(strike * 1000):08d}"
+    return f"{ticker}{date_part}{cp}{strike_part}"
 
 
 def _load_state() -> dict:
@@ -79,24 +86,31 @@ def _entry_locked(state: dict) -> bool:
     return state.get("last_entry_session") == _session_id()
 
 
-def _poll_order_confirmed(rh, order_id: str, is_option: bool = False, timeout: float = 20.0) -> bool:
+def _submit_market_order(client, symbol: str, qty: float, side: OrderSide):
+    request = MarketOrderRequest(symbol=symbol, qty=qty, side=side, time_in_force=_TIME_IN_FORCE)
+    return client.submit_order(request)
+
+
+def _submit_limit_order(client, symbol: str, qty: float, side: OrderSide, limit_price: float):
+    request = LimitOrderRequest(symbol=symbol, qty=qty, side=side, time_in_force=_TIME_IN_FORCE, limit_price=limit_price)
+    return client.submit_order(request)
+
+
+def _poll_order_confirmed(client, order_id: str, timeout: float = 20.0) -> bool:
     """After every order, poll status; caller stops the cycle if unconfirmed
-    (no second market order same cycle) — SRS §8.5. robin_stocks uses a
-    distinct lookup for option orders (get_option_order_info) vs equity
-    orders (get_stock_order_info) — calling the wrong one for CLOSE_OPTION
-    or a BUY_*_PUT/CALL fill would silently mis-report every option order
-    as unconfirmed."""
-    lookup = rh.get_option_order_info if is_option else rh.get_stock_order_info
+    (no second market order same cycle) — SRS §8.5. Alpaca uses one unified
+    get_order_by_id() lookup for both equity and option orders, unlike RH's
+    split get_stock_order_info/get_option_order_info."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            info = lookup(order_id) if order_id else None
+            order = client.get_order_by_id(order_id) if order_id else None
         except Exception:  # noqa: BLE001
-            info = None
-        state = (info or {}).get("state")
-        if state in ("filled", "confirmed", "queued", "partially_filled"):
+            order = None
+        status = getattr(order, "status", None)
+        if status in _CONFIRMED_STATUSES:
             return True
-        if state in ("rejected", "cancelled", "failed"):
+        if status in _TERMINAL_REJECTED_STATUSES:
             return False
         time.sleep(2)
     return False
@@ -150,9 +164,9 @@ def _size_and_explain_option(contract, nav: float, sleeve_mv: float) -> tuple[in
     Shared by the put and call entry branches. Returns (quantity,
     proposed_mv, skip_reason) — skip_reason is "" iff quantity > 0.
     Zero-premium contracts (bid=ask=0, e.g. a thin fallback strike with no
-    real market — hit live 2026-08-19 on a VXX put fallback) get their own
-    message: "exceeds sleeve headroom" would be actively misleading there,
-    since more NAV wouldn't fix an untradeable quote.
+    real market) get their own message: "exceeds sleeve headroom" would be
+    actively misleading there, since more NAV wouldn't fix an untradeable
+    quote.
     """
     premium = contract.mid * 100
     if premium <= 0:
@@ -186,21 +200,20 @@ def execute_actions(
 
     dry_run=True runs every real gating check (kill switch, session state,
     ENABLE_VIX_AUTO_SELL/BUY, sleeve %, per-cycle/per-session caps) against
-    real inputs, but stops short of calling any robin_stocks order
-    function — see _execute_flatten/_execute_entry. Session-scoped state
+    real inputs, but stops short of calling Alpaca's submit_order — see
+    _execute_flatten/_execute_entry. Session-scoped state
     (last_entry_session, last_flatten_session) is tracked in-memory for the
     duration of this call so the caps behave identically to a live run, but
     is never persisted to VIX_STATE_FILE, so a dry run leaves no trace that
     could confuse a subsequent real run's re-entry lock.
     """
     outcomes: list[ExecutionOutcome] = []
-    if session.rh_module is None:
+    if session.client is None:
         for a in actions:
             outcomes.append(ExecutionOutcome(a, False, skip_reason=f"session not usable ({session.state})"))
         return outcomes
 
-    rh = session.rh_module
-    account_number = _account_number()
+    client = session.client
     state = _load_state()
     orders_this_cycle = 0
 
@@ -229,7 +242,7 @@ def execute_actions(
                 outcomes.append(ExecutionOutcome(action, False, skip_reason=f"session {session.state} cannot flatten"))
                 continue
 
-            outcome = _execute_flatten(rh, action, account_number, dry_run=dry_run)
+            outcome = _execute_flatten(client, action, dry_run=dry_run)
             outcomes.append(outcome)
             if outcome.executed or outcome.would_execute:
                 orders_this_cycle += 1
@@ -238,7 +251,7 @@ def execute_actions(
                 if not dry_run:
                     _save_state(state)
                 if outcome.executed:
-                    confirmed = _poll_order_confirmed(rh, outcome.order_id, is_option=(action.action == CLOSE_OPTION))
+                    confirmed = _poll_order_confirmed(client, outcome.order_id)
                     if not confirmed:
                         outcomes[-1].skip_reason = "order unconfirmed — stopping cycle, no second market order"
                         break
@@ -309,7 +322,7 @@ def execute_actions(
                 outcomes.append(ExecutionOutcome(action, False, skip_reason="sleeve % cap would be exceeded"))
                 continue
 
-            outcome = _execute_entry(rh, action, account_number, price, quantity=quantity, contract=contract, dry_run=dry_run)
+            outcome = _execute_entry(client, action, price, quantity=quantity, contract=contract, dry_run=dry_run)
             outcomes.append(outcome)
             if outcome.executed or outcome.would_execute:
                 orders_this_cycle += 1
@@ -317,7 +330,7 @@ def execute_actions(
                 if not dry_run:
                     _save_state(state)
                 if outcome.executed:
-                    confirmed = _poll_order_confirmed(rh, outcome.order_id, is_option=(action.action != BUY_SVIX_SHARES))
+                    confirmed = _poll_order_confirmed(client, outcome.order_id)
                     if not confirmed:
                         outcomes[-1].skip_reason = "order unconfirmed — stopping cycle, no second market order"
                         break
@@ -338,13 +351,13 @@ def execute_actions(
                 continue
 
             roll_price = quote_fn(action.ticker) if action.ticker else None
-            roll_outcomes = _execute_roll(rh, action, account_number, roll_price, dry_run=dry_run)
+            roll_outcomes = _execute_roll(client, action, roll_price, dry_run=dry_run)
             outcomes.extend(roll_outcomes)
             orders_this_cycle += sum(1 for o in roll_outcomes if o.executed or o.would_execute)
 
             last_leg = roll_outcomes[-1]
             if last_leg.executed:
-                confirmed = _poll_order_confirmed(rh, last_leg.order_id, is_option=True)
+                confirmed = _poll_order_confirmed(client, last_leg.order_id)
                 if not confirmed:
                     outcomes[-1].skip_reason = "roll open leg unconfirmed — stopping cycle, no further orders"
                     break
@@ -360,45 +373,40 @@ def execute_actions(
     return outcomes
 
 
-def _execute_flatten(rh, action: Action, account_number: str, dry_run: bool = False) -> ExecutionOutcome:
+def _execute_flatten(client, action: Action, dry_run: bool = False) -> ExecutionOutcome:
     try:
         if action.ticker == "SVIX" and action.position and action.position.get("type") == "share":
             qty = action.position.get("quantity", 0)
             if qty <= 0:
                 return ExecutionOutcome(action, False, skip_reason="no SVIX quantity to sell")
             preview = {
-                "call": "order_sell_market", "symbol": action.ticker, "quantity": qty,
-                "account_number": account_number, "timeInForce": _TIME_IN_FORCE,
+                "call": "submit_order", "order_type": "market", "symbol": action.ticker,
+                "quantity": qty, "side": "sell", "time_in_force": "day",
             }
             if dry_run:
                 return ExecutionOutcome(
                     action, False, would_execute=True, order_preview=preview, dry_run=True,
                     skip_reason="DRY RUN — order not submitted",
                 )
-            resp = rh.order_sell_market(
-                action.ticker, qty, account_number=account_number, timeInForce=_TIME_IN_FORCE
-            )
-            return ExecutionOutcome(action, True, would_execute=True, order_preview=preview, order_id=(resp or {}).get("id"))
+            order = _submit_market_order(client, action.ticker, qty, OrderSide.SELL)
+            return ExecutionOutcome(action, True, would_execute=True, order_preview=preview, order_id=str(order.id))
 
         if action.action == CLOSE_OPTION and action.position:
             pos = action.position
+            occ = _occ_symbol(pos["ticker"], pos["expiry"], pos["strike"], pos["option_type"])
+            limit_price = round(pos.get("mid_price", pos.get("cost_basis", 0)) / 100, 2)
+            qty = pos.get("contracts", 1)
             preview = {
-                "call": "order_sell_option_limit", "position_effect": "close", "credit_or_debit": "credit",
-                "price": pos.get("mid_price", pos.get("cost_basis", 0)), "symbol": pos["ticker"],
-                "quantity": pos.get("contracts", 1), "expiry": pos["expiry"], "strike": pos["strike"],
-                "option_type": pos["option_type"], "account_number": account_number, "timeInForce": _TIME_IN_FORCE,
+                "call": "submit_order", "order_type": "limit", "symbol": occ,
+                "quantity": qty, "side": "sell", "limit_price": limit_price, "time_in_force": "day",
             }
             if dry_run:
                 return ExecutionOutcome(
                     action, False, would_execute=True, order_preview=preview, dry_run=True,
                     skip_reason="DRY RUN — order not submitted",
                 )
-            resp = rh.order_sell_option_limit(
-                "close", "credit", pos.get("mid_price", pos.get("cost_basis", 0)),
-                pos["ticker"], pos.get("contracts", 1), pos["expiry"], pos["strike"], pos["option_type"],
-                account_number=account_number, timeInForce=_TIME_IN_FORCE,
-            )
-            return ExecutionOutcome(action, True, would_execute=True, order_preview=preview, order_id=(resp or {}).get("id"))
+            order = _submit_limit_order(client, occ, qty, OrderSide.SELL, limit_price)
+            return ExecutionOutcome(action, True, would_execute=True, order_preview=preview, order_id=str(order.id))
 
         return ExecutionOutcome(action, False, skip_reason="no matching flatten handler")
     except Exception as exc:  # noqa: BLE001
@@ -406,7 +414,7 @@ def _execute_flatten(rh, action: Action, account_number: str, dry_run: bool = Fa
 
 
 def _execute_entry(
-    rh, action: Action, account_number: str, price: float | None,
+    client, action: Action, price: float | None,
     quantity: int | None = None, contract=None, dry_run: bool = False,
 ) -> ExecutionOutcome:
     try:
@@ -420,18 +428,16 @@ def _execute_entry(
                 # primary path.
                 return ExecutionOutcome(action, False, skip_reason="sized to 0 shares — refusing to submit")
             preview = {
-                "call": "order_buy_market", "symbol": action.ticker, "quantity": quantity,
-                "account_number": account_number, "timeInForce": _TIME_IN_FORCE,
+                "call": "submit_order", "order_type": "market", "symbol": action.ticker,
+                "quantity": quantity, "side": "buy", "time_in_force": "day",
             }
             if dry_run:
                 return ExecutionOutcome(
                     action, False, would_execute=True, order_preview=preview, dry_run=True,
                     skip_reason="DRY RUN — order not submitted",
                 )
-            resp = rh.order_buy_market(
-                action.ticker, quantity, account_number=account_number, timeInForce=_TIME_IN_FORCE
-            )
-            return ExecutionOutcome(action, True, would_execute=True, order_preview=preview, order_id=(resp or {}).get("id"))
+            order = _submit_market_order(client, action.ticker, quantity, OrderSide.BUY)
+            return ExecutionOutcome(action, True, would_execute=True, order_preview=preview, order_id=str(order.id))
 
         if action.action in (BUY_UVXY_PUT, BUY_VXX_PUT, BUY_VXX_CALL, BUY_UVXY_CALL):
             if contract is None or not quantity or quantity <= 0:
@@ -442,23 +448,18 @@ def _execute_entry(
             # Pay the ask on a buy-to-open — a marketable limit, not a
             # market order (SRS: never 0-DTE / defined-risk options only,
             # a naked market order on an option is not that).
+            occ = _occ_symbol(contract.ticker, contract.expiry, contract.strike, contract.option_type)
             preview = {
-                "call": "order_buy_option_limit", "position_effect": "open", "credit_or_debit": "debit",
-                "price": contract.ask, "symbol": contract.ticker, "quantity": quantity,
-                "expiry": contract.expiry, "strike": contract.strike, "option_type": contract.option_type,
-                "account_number": account_number, "timeInForce": _TIME_IN_FORCE,
+                "call": "submit_order", "order_type": "limit", "symbol": occ,
+                "quantity": quantity, "side": "buy", "limit_price": contract.ask, "time_in_force": "day",
             }
             if dry_run:
                 return ExecutionOutcome(
                     action, False, would_execute=True, order_preview=preview, dry_run=True,
                     skip_reason="DRY RUN — order not submitted",
                 )
-            resp = rh.order_buy_option_limit(
-                "open", "debit", contract.ask, contract.ticker, quantity,
-                contract.expiry, contract.strike, contract.option_type,
-                account_number=account_number, timeInForce=_TIME_IN_FORCE,
-            )
-            return ExecutionOutcome(action, True, would_execute=True, order_preview=preview, order_id=(resp or {}).get("id"))
+            order = _submit_limit_order(client, occ, quantity, OrderSide.BUY, contract.ask)
+            return ExecutionOutcome(action, True, would_execute=True, order_preview=preview, order_id=str(order.id))
 
         return ExecutionOutcome(action, False, skip_reason="unrecognized entry action")
     except Exception as exc:  # noqa: BLE001
@@ -478,7 +479,7 @@ def _roll_entry_action_for(contract) -> str:
 
 
 def _execute_roll(
-    rh, action: Action, account_number: str, spot_price: float | None, dry_run: bool = False,
+    client, action: Action, spot_price: float | None, dry_run: bool = False,
 ) -> list[ExecutionOutcome]:
     """
     Roll = close the existing contract, then open a similar contract in a
@@ -510,14 +511,14 @@ def _execute_roll(
         return [ExecutionOutcome(action, False, skip_reason="no contracts to roll")]
 
     close_action = Action(CLOSE_OPTION, ticker, action.reason, pos)
-    close_outcome = _execute_flatten(rh, close_action, account_number, dry_run=dry_run)
+    close_outcome = _execute_flatten(client, close_action, dry_run=dry_run)
     outcomes = [close_outcome]
 
     if not (close_outcome.executed or close_outcome.would_execute):
         return outcomes  # couldn't even preview/submit the close leg — stop here
 
     if close_outcome.executed and not dry_run:
-        confirmed = _poll_order_confirmed(rh, close_outcome.order_id, is_option=True)
+        confirmed = _poll_order_confirmed(client, close_outcome.order_id)
         if not confirmed:
             outcomes[0].skip_reason = "roll close leg unconfirmed — stopping before opening the new leg"
             return outcomes
@@ -543,10 +544,9 @@ def _execute_roll(
 
     if new_contract.mid <= 0:
         # Same "no real market" edge case _size_and_explain_option() guards
-        # on the regular entry path (hit live 2026-08-19 on a thin VXX put)
-        # — the roll bypasses that function entirely (quantity is preserved
-        # 1:1, not re-sized), so it needs its own check here or it would
-        # submit a limit order at price=0.0.
+        # on the regular entry path — the roll bypasses that function
+        # entirely (quantity is preserved 1:1, not re-sized), so it needs
+        # its own check here or it would submit a limit order at price=0.0.
         outcomes.append(ExecutionOutcome(
             action, False,
             skip_reason=(
@@ -560,7 +560,7 @@ def _execute_roll(
 
     open_action = Action(_roll_entry_action_for(new_contract), new_contract.ticker, action.reason)
     open_outcome = _execute_entry(
-        rh, open_action, account_number, spot_price,
+        client, open_action, spot_price,
         quantity=quantity, contract=new_contract, dry_run=dry_run,
     )
     outcomes.append(open_outcome)

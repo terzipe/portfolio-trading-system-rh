@@ -13,3 +13,4 @@ google-auth>=2.34.0
 google-auth-oauthlib>=1.2.1
 pytest>=8.3.0
 websocket-client>=1.8.0    # only used if UW_HAS_WEBSOCKET=true
+alpaca-py>=0.44.0          # VIX Trader BOT broker (paper trading)

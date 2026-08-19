@@ -1,59 +1,48 @@
 """
-VIX Trader BOT — fail-closed Robinhood session gate (SRS v1.4 §8.2-§8.4,
-Impl Plan §2A). This is the gate in front of every live order the VIX
-sleeve places. Unofficial robin_stocks is not a reliable broker; `held: []`
-is not proof of a flat book.
+VIX Trader BOT — fail-closed Alpaca paper-trading session gate (SRS v1.4
+§8.2-§8.4, Impl Plan §2A). This is the gate in front of every order the VIX
+sleeve places. `held: []` is not proof of a flat book — same BOOK_MISMATCH
+philosophy as the Robinhood version this replaces.
 
-Deliberately does NOT call monitor.layer0_universe._rh_login() as-is: that
-function's fallback path calls a full interactive rh.login() when the
-refresh token is dead (see its docstring / final `rh.login(...)` call).
-That fallback triggers Robinhood's device-approval push challenge, which
-Impl Plan §2A explicitly forbids in unattended loops ("Full rh.login() /
-device-approval polling"). This module re-implements only the safe
-pickle-load + single-refresh-attempt portion and stops at DEAD instead of
-falling through to a full login. Full interactive login stays exclusively
-in rh_reauth.py, run by a human.
+Migrated from Robinhood: Alpaca paper trading authenticates with a static
+API key pair (ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY), not a pickled OAuth
+token. There is no refresh dance and no device-approval challenge to avoid,
+so this module is a straight construct-client-then-run-checklist, unlike
+the RH version's pickle-load + single-refresh-attempt dance.
 """
 from __future__ import annotations
 
-import base64
 import json
-import pickle
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 
-import requests
+from alpaca.trading.client import TradingClient
 
 from config import (
-    VIX_ACCOUNT,
+    ALPACA_API_KEY_ID,
+    ALPACA_API_SECRET_KEY,
     VIX_SESSION_STATE_FILE,
     VIX_SHADOW_BOOK_FILE,
     VIX_SESSION_DEAD_COOLDOWN_SEC,
-    VIX_TOKEN_REAUTH_WARN_SEC,
     VIX_SHADOW_BOOK_MAX_AGE_SEC,
 )
-from monitor.layer0_universe import _AGENTIC_ACCOUNT, _MARGIN_ACCOUNT
-
-_PICKLE = Path.home() / ".tokens" / "robinhood.pickle"
-_CLIENT_ID = "c82SH0WZOsabOXGP2sxqcj34FxkvfnWRZBKlBjFS"
-
-_ACCOUNT_NUMBERS = {"AGENTIC": _AGENTIC_ACCOUNT, "MARGIN": _MARGIN_ACCOUNT}
 
 HEALTHY = "HEALTHY"
 DEGRADED = "DEGRADED"
 DEAD = "DEAD"
+
+_VOL_TICKERS = {"SVIX", "VXX", "UVXY"}
 
 
 @dataclass
 class SessionResult:
     state: str
     reason: str = ""
-    token_exp: float | None = None
+    token_exp: float | None = None  # kept for dashboard TTL widget compat; always None for Alpaca (no expiring token)
     last_refresh_at: float | None = None
     account_ok: bool = False
     buying_power: float | None = None
-    rh_module: object = None  # the logged-in robin_stocks module, if HEALTHY/DEGRADED
+    client: object = None  # the authenticated Alpaca TradingClient, if HEALTHY/DEGRADED
     checks: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
@@ -106,74 +95,19 @@ def _shadow_book_has_vol_names(max_age_sec: int = VIX_SHADOW_BOOK_MAX_AGE_SEC) -
         return False
     if (time.time() - shadow.get("saved_at", 0)) > max_age_sec:
         return False
-    vol_tickers = {"SVIX", "VXX", "UVXY"}
-    return any(p.get("ticker") in vol_tickers for p in shadow.get("positions", []))
+    return any(p.get("ticker") in _VOL_TICKERS for p in shadow.get("positions", []))
 
 
 def _save_state(result: SessionResult) -> None:
     VIX_SESSION_STATE_FILE.write_text(json.dumps(result.as_dict(), indent=2))
 
 
-def _safe_session_refresh() -> tuple[object | None, float | None, str]:
-    """
-    Pickle-load + at most one OAuth refresh. Returns (rh_module, token_exp,
-    error). Never falls through to a full rh.login() — that path is
-    forbidden in unattended loops (see module docstring).
-    """
-    import robin_stocks.robinhood as rh
-    from robin_stocks.robinhood.helper import update_session, set_login_state
-
-    if not _PICKLE.exists():
-        return None, None, "no pickle on disk"
-
-    try:
-        with open(_PICKLE, "rb") as f:
-            tok = pickle.load(f)
-        access = tok.get("access_token", "")
-        refresh = tok.get("refresh_token", "")
-        device = tok.get("device_token", "")
-
-        parts = access.split(".")
-        exp = json.loads(base64.urlsafe_b64decode(parts[1] + "==")).get("exp", 0)
-
-        if exp > time.time():
-            set_login_state(True)
-            update_session("Authorization", f"Bearer {access}")
-            return rh, exp, ""
-
-        # Exactly one refresh attempt. Save the new tokens before any
-        # second call — Robinhood rotates the refresh token on every use.
-        resp = requests.post(
-            "https://api.robinhood.com/oauth2/token/",
-            json={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh,
-                "client_id": _CLIENT_ID,
-                "device_token": device,
-                "scope": "internal",
-            },
-            timeout=10,
-        )
-        if resp.status_code == 429:
-            return None, None, "429 on token refresh"
-
-        new = resp.json()
-        if "access_token" not in new or "refresh_token" not in new:
-            return None, None, f"refresh did not return tokens: {new}"
-
-        tok["access_token"] = new["access_token"]
-        tok["refresh_token"] = new["refresh_token"]
-        with open(_PICKLE, "wb") as f:
-            pickle.dump(tok, f)
-
-        new_parts = new["access_token"].split(".")
-        new_exp = json.loads(base64.urlsafe_b64decode(new_parts[1] + "==")).get("exp", 0)
-
-        set_login_state(True)
-        update_session("Authorization", f"Bearer {new['access_token']}")
-        return rh, new_exp, ""
-    except Exception as exc:  # noqa: BLE001 — any failure here means DEAD, not a crash
-        return None, None, f"{type(exc).__name__}: {exc}"
+def _build_client():
+    """Construct the paper-trading TradingClient. Returns None if API keys
+    are missing — that's a DEAD condition, not a crash."""
+    if not ALPACA_API_KEY_ID or not ALPACA_API_SECRET_KEY:
+        return None
+    return TradingClient(ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY, paper=True)
 
 
 def assess() -> SessionResult:
@@ -186,44 +120,39 @@ def assess() -> SessionResult:
         return SessionResult(state=DEAD, reason="in post-DEAD cooldown, not retrying")
 
     checks = {}
-    rh, exp, err = _safe_session_refresh()
-    checks["token_valid_or_refreshed"] = rh is not None
-    if rh is None:
-        result = SessionResult(state=DEAD, reason=f"session refresh failed: {err}", checks=checks)
+    client = _build_client()
+    checks["client_built"] = client is not None
+    if client is None:
+        result = SessionResult(state=DEAD, reason="ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY not set", checks=checks)
         _save_state(result)
         return result
 
-    account_number = _ACCOUNT_NUMBERS.get(VIX_ACCOUNT, _AGENTIC_ACCOUNT)
-
     try:
-        profile = rh.load_portfolio_profile(account_number=account_number)
-        buying_power = float(profile.get("equity", "nan"))
-        account_ok = profile.get("account_number") in (None, account_number)  # tolerate API variance
+        account = client.get_account()
+        buying_power = float(account.buying_power)
+        account_ok = account.status == "ACTIVE" and not account.trading_blocked and not account.account_blocked
         checks["account_ok"] = bool(account_ok)
         checks["buying_power_numeric"] = buying_power == buying_power  # NaN check
     except Exception as exc:  # noqa: BLE001
-        result = SessionResult(
-            state=DEAD, reason=f"account/equity check failed: {exc}",
-            token_exp=exp, checks=checks,
-        )
+        result = SessionResult(state=DEAD, reason=f"account/equity check failed: {exc}", checks=checks)
         _save_state(result)
         return result
 
     if not checks["account_ok"] or not checks["buying_power_numeric"]:
         result = SessionResult(
             state=DEAD, reason="account_ok or buying_power check failed",
-            token_exp=exp, buying_power=buying_power, checks=checks,
+            buying_power=buying_power, checks=checks,
         )
         _save_state(result)
         return result
 
     try:
-        positions = rh.get_open_stock_positions(account_number=account_number)
+        positions = client.get_all_positions()
         checks["positions_payload_structured"] = isinstance(positions, list)
     except Exception as exc:  # noqa: BLE001
         result = SessionResult(
             state=DEAD, reason=f"positions call failed: {exc}",
-            token_exp=exp, buying_power=buying_power, checks=checks,
+            buying_power=buying_power, checks=checks,
         )
         _save_state(result)
         return result
@@ -231,13 +160,13 @@ def assess() -> SessionResult:
     if not checks["positions_payload_structured"]:
         result = SessionResult(
             state=DEAD, reason="positions payload not structured (API error, not empty list)",
-            token_exp=exp, buying_power=buying_power, checks=checks,
+            buying_power=buying_power, checks=checks,
         )
         _save_state(result)
         return result
 
     normalized = [
-        {"ticker": p.get("symbol") or p.get("ticker", ""), "quantity": p.get("quantity")}
+        {"ticker": p.symbol, "quantity": p.qty}
         for p in positions
     ]
 
@@ -245,7 +174,7 @@ def assess() -> SessionResult:
         result = SessionResult(
             state=DEAD,
             reason="BOOK_MISMATCH: held:[] but shadow book had SVIX/VXX/UVXY within max age",
-            token_exp=exp, buying_power=buying_power, checks=checks,
+            buying_power=buying_power, checks=checks,
         )
         _save_state(result)
         return result
@@ -254,20 +183,14 @@ def assess() -> SessionResult:
     result = SessionResult(
         state=HEALTHY,
         reason="all checks passed",
-        token_exp=exp,
         last_refresh_at=time.time(),
         account_ok=True,
         buying_power=buying_power,
-        rh_module=rh,
+        client=client,
         checks=checks,
     )
     _save_state(result)
     _save_shadow_book(normalized)
-
-    ttl = (exp or 0) - time.time()
-    if 0 < ttl < VIX_TOKEN_REAUTH_WARN_SEC:
-        result.reason = f"HEALTHY, but token TTL {ttl/3600:.1f}h < warn threshold — reauth soon"
-
     return result
 
 

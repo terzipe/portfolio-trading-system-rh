@@ -1,107 +1,121 @@
 """
-S0 acceptance fixtures for monitor/vix_session.py (Impl Plan §2A):
-  - expired JWT + good refresh -> HEALTHY, pickle updated once
-  - 429 on refresh -> DEAD, zero rh.login() calls
-  - empty positions + shadow SVIX 10 min old -> BOOK_MISMATCH, DEAD
-  - empty positions + empty/old shadow + all other checks pass -> HEALTHY, actually flat
+S0 acceptance fixtures for monitor/vix_session.py, migrated to Alpaca paper
+trading (Impl Plan §2A). Alpaca authenticates with a static API key pair,
+not RH's pickled OAuth token, so there's no refresh-dance/429 drill left to
+pin at this layer (that risk doesn't exist for Alpaca's auth model). What's
+still pinned here: DEAD when the client can't be built or the
+account/positions calls fail, and the same BOOK_MISMATCH fail-closed logic
+as the RH version this replaced.
 
 No network in CI — everything below is mocked.
 """
-import base64
 import json
-import pickle
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
 from monitor import vix_session
 
 
-def _fake_jwt(exp: float) -> str:
-    header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
-    payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).rstrip(b"=").decode()
-    return f"{header}.{payload}.sig"
-
-
 @pytest.fixture
 def isolated_paths(tmp_path, monkeypatch):
-    pickle_path = tmp_path / "robinhood.pickle"
     session_state = tmp_path / "session_state.json"
     shadow_book = tmp_path / "last_known_positions.json"
-    monkeypatch.setattr(vix_session, "_PICKLE", pickle_path)
     monkeypatch.setattr(vix_session, "VIX_SESSION_STATE_FILE", session_state)
     monkeypatch.setattr(vix_session, "VIX_SHADOW_BOOK_FILE", shadow_book)
-    return SimpleNamespace(pickle=pickle_path, session_state=session_state, shadow_book=shadow_book)
+    return SimpleNamespace(session_state=session_state, shadow_book=shadow_book)
 
 
-def _write_pickle(path, access_exp: float, refresh: str = "r1", device: str = "d1"):
-    tok = {"access_token": _fake_jwt(access_exp), "refresh_token": refresh, "device_token": device}
-    with open(path, "wb") as f:
-        pickle.dump(tok, f)
+class _FakeAccount:
+    def __init__(self, buying_power="1000.0", status="ACTIVE", trading_blocked=False, account_blocked=False):
+        self.buying_power = buying_power
+        self.status = status
+        self.trading_blocked = trading_blocked
+        self.account_blocked = account_blocked
 
 
-def _mock_rh(monkeypatch, equity="1000.0", account_number="725024723", positions=None):
-    import robin_stocks.robinhood as rh_real
-
-    login_mock = MagicMock()
-    monkeypatch.setattr(rh_real, "login", login_mock)
-    monkeypatch.setattr(
-        rh_real, "load_portfolio_profile",
-        lambda account_number=None: {"equity": equity, "account_number": account_number},
-    )
-    monkeypatch.setattr(
-        rh_real, "get_open_stock_positions",
-        lambda account_number=None: positions if positions is not None else [],
-    )
-    return login_mock
+class _FakePosition:
+    def __init__(self, symbol, qty):
+        self.symbol = symbol
+        self.qty = qty
 
 
-def test_expired_jwt_good_refresh_healthy(isolated_paths, monkeypatch):
-    _write_pickle(isolated_paths.pickle, access_exp=time.time() - 3600)
-    new_access = _fake_jwt(time.time() + 3600)
+class _FakeClient:
+    def __init__(self, account=None, positions=None, positions_error=None, account_error=None):
+        self._account = account or _FakeAccount()
+        self._positions = positions if positions is not None else []
+        self._positions_error = positions_error
+        self._account_error = account_error
 
-    class FakeResp:
-        status_code = 200
-        def json(self):
-            return {"access_token": new_access, "refresh_token": "r2"}
+    def get_account(self):
+        if self._account_error:
+            raise self._account_error
+        return self._account
 
-    monkeypatch.setattr(vix_session.requests, "post", lambda *a, **k: FakeResp())
-    login_mock = _mock_rh(monkeypatch)
+    def get_all_positions(self):
+        if self._positions_error:
+            raise self._positions_error
+        return self._positions
+
+
+def _mock_client(monkeypatch, **kwargs):
+    client = _FakeClient(**kwargs)
+    monkeypatch.setattr(vix_session, "_build_client", lambda: client)
+    return client
+
+
+def test_healthy_when_account_and_positions_ok(isolated_paths, monkeypatch):
+    _mock_client(monkeypatch, positions=[])
 
     result = vix_session.assess()
 
     assert result.state == vix_session.HEALTHY
-    assert login_mock.call_count == 0
-    saved = pickle.load(open(isolated_paths.pickle, "rb"))
-    assert saved["access_token"] == new_access
+    assert result.buying_power == 1000.0
+    assert result.client is not None
 
 
-def test_429_on_refresh_is_dead_no_login(isolated_paths, monkeypatch):
-    _write_pickle(isolated_paths.pickle, access_exp=time.time() - 3600)
-
-    class FakeResp:
-        status_code = 429
-        def json(self):
-            return {}
-
-    monkeypatch.setattr(vix_session.requests, "post", lambda *a, **k: FakeResp())
-    login_mock = _mock_rh(monkeypatch)
+def test_dead_when_api_keys_missing(isolated_paths, monkeypatch):
+    monkeypatch.setattr(vix_session, "_build_client", lambda: None)
 
     result = vix_session.assess()
 
     assert result.state == vix_session.DEAD
-    assert login_mock.call_count == 0
+    assert "ALPACA_API_KEY_ID" in result.reason
+
+
+def test_dead_when_account_call_fails(isolated_paths, monkeypatch):
+    _mock_client(monkeypatch, account_error=Exception("boom"))
+
+    result = vix_session.assess()
+
+    assert result.state == vix_session.DEAD
+    assert "account/equity check failed" in result.reason
+
+
+def test_dead_when_account_blocked(isolated_paths, monkeypatch):
+    _mock_client(monkeypatch, account=_FakeAccount(trading_blocked=True))
+
+    result = vix_session.assess()
+
+    assert result.state == vix_session.DEAD
+
+
+def test_dead_when_positions_call_fails(isolated_paths, monkeypatch):
+    _mock_client(monkeypatch, positions_error=Exception("boom"))
+
+    result = vix_session.assess()
+
+    assert result.state == vix_session.DEAD
+    assert "positions call failed" in result.reason
 
 
 def test_empty_positions_with_recent_shadow_svix_is_book_mismatch(isolated_paths, monkeypatch):
-    _write_pickle(isolated_paths.pickle, access_exp=time.time() + 3600)
     isolated_paths.shadow_book.write_text(json.dumps({
         "saved_at": time.time() - 600,  # 10 minutes old
         "positions": [{"ticker": "SVIX", "quantity": 10}],
     }))
-    _mock_rh(monkeypatch, positions=[])
+    _mock_client(monkeypatch, positions=[])
 
     result = vix_session.assess()
 
@@ -110,8 +124,7 @@ def test_empty_positions_with_recent_shadow_svix_is_book_mismatch(isolated_paths
 
 
 def test_empty_positions_no_shadow_is_healthy_and_flat(isolated_paths, monkeypatch):
-    _write_pickle(isolated_paths.pickle, access_exp=time.time() + 3600)
-    _mock_rh(monkeypatch, positions=[])
+    _mock_client(monkeypatch, positions=[])
 
     result = vix_session.assess()
 
@@ -125,3 +138,12 @@ def test_cooldown_blocks_immediate_retry_after_dead(isolated_paths, monkeypatch)
 
     assert result.state == vix_session.DEAD
     assert "cooldown" in result.reason
+
+
+def test_healthy_saves_shadow_book_from_positions(isolated_paths, monkeypatch):
+    _mock_client(monkeypatch, positions=[_FakePosition("SVIX", "10")])
+
+    vix_session.assess()
+
+    saved = json.loads(isolated_paths.shadow_book.read_text())
+    assert saved["positions"] == [{"ticker": "SVIX", "quantity": "10"}]

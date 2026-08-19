@@ -29,7 +29,11 @@ UW_TIER = os.getenv("UW_TIER", "basic")  # basic|advanced
 UW_HAS_WEBSOCKET = os.getenv("UW_HAS_WEBSOCKET", "false").lower() == "true"
 UW_HAS_CME_FUTURES = os.getenv("UW_HAS_CME_FUTURES", "false").lower() == "true"
 
-VIX_ACCOUNT = os.getenv("VIX_ACCOUNT", "AGENTIC")
+# Alpaca paper trading (VIX bot's broker; no AGENTIC/MARGIN split — one
+# paper account per API key pair, unlike the RH account this replaced).
+ALPACA_API_KEY_ID = os.getenv("ALPACA_API_KEY_ID")
+ALPACA_API_SECRET_KEY = os.getenv("ALPACA_API_SECRET_KEY")
+
 VIX_SLEEVE_MAX_PCT = float(os.getenv("VIX_SLEEVE_MAX_PCT", 0.05))
 VIX_SVIX_MAX_PCT = float(os.getenv("VIX_SVIX_MAX_PCT", 0.05))
 VIX_MAX_CONTRACTS = int(os.getenv("VIX_MAX_CONTRACTS", 5))

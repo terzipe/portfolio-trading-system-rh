@@ -408,6 +408,45 @@ already; see root repo git history for the fix).
   returns.
 
 ### VIX Trader — Lessons learned
+- 2026-08-19: Added monitor/vix_ledger.py — Alpaca "gold copy" balance/P&L (account_snapshot,
+  positions_snapshot, fetch_fill_activities, fifo_realized_pnl), sourced from Alpaca's own
+  get_account()/get_all_positions()/GET /account/activities instead of the local paper ledger.
+  /account/activities has no typed method on alpaca-py's TradingClient — reached via the untyped
+  client.get(path, data) escape hatch; confirmed live it works and paginates via page_token.
+  Unlike the old RH-era realized P&L (FIFO-matched from the bot's own paper_ledger.jsonl, blind to
+  anything not placed through the automated loops), this sees every fill on the account regardless
+  of origin — the dashboard's manual buttons or a trade placed directly in Alpaca's UI. Wired into
+  both loop scripts' dashboard_cache.json as "alpaca_gold_copy", additive alongside the existing
+  UW-mark-based unrealized_pnl (still the bot's own decision-input signal, untouched). Dashboard's
+  Sleeve P&L section now shows Alpaca's own numbers as authoritative; local paper ledger relabeled
+  "Bot decision log" — still the only place skip reasons and non-executed proposed actions live,
+  since those never become a real Alpaca fill. Also added a per-position "Close" button to Manual
+  controls (regime_trader/dashboard/app.py) for UVXY/VXX/SVIX option positions, reusing the same
+  CLOSE_OPTION path vix_executor.execute_actions() already handles — no new broker logic.
+- 2026-08-19: Switched the VIX bot's broker from Robinhood to Alpaca paper trading
+  (vix_session.py, vix_positions.py, vix_executor.py rewritten; scope deliberately excluded
+  monitor/layer0_universe.py and broker/robinhood.py, which stay on RH for the main portfolio
+  monitor). Alpaca uses a static API key pair (ALPACA_API_KEY_ID/SECRET_KEY, paper=True) instead
+  of RH's pickled OAuth token — no refresh dance, no device-approval risk, so vix_session.py is
+  now much simpler. Alpaca has one paper account per key pair (no AGENTIC/MARGIN split), so
+  VIX_ACCOUNT/_ACCOUNT_NUMBERS were dropped entirely. Options are submitted via OCC symbols
+  (e.g. "UVXY260115P00054000", built/parsed by _occ_symbol()/_parse_occ_symbol() — root ticker is
+  NOT padded to a fixed width like the raw OCC spec, so parsing anchors from the right: last 15
+  chars are always YYMMDD+C/P+8-digit strike*1000). Found and fixed one real correctness bug this
+  surfaced: Alpaca's limit_price is dollars-per-share, but vix_positions.py's mid_price/cost_basis
+  are dollars-per-contract (mark*100) — CLOSE_OPTION/roll-close now divide by 100 before building
+  the Alpaca order, which RH's robin_stocks call apparently didn't require (or silently tolerated).
+  Confirmation polling collapsed from RH's split get_stock_order_info/get_option_order_info to one
+  unified client.get_order_by_id(). Live-verified: assess() HEALTHY against the real paper account
+  (options_trading_level=3, full spreads enabled), fetch_positions() on a flat account, and a real
+  paper SVIX buy through vix_executor.execute_actions() (order accepted by Alpaca, order id
+  a042149d-...) — but it queued rather than filled instantly because markets were closed
+  (is_open=False, next_open 2026-08-20 09:30 ET); market orders aren't extended-hours eligible.
+  Fill + automated-flatten verification will complete naturally via the existing scheduled
+  LaunchAgents once RTH opens — no script changes needed there, loop_daily_vix.py/
+  loop_intraday_vix.py already point at the same session.client the rewritten modules return.
+  86/86 tests passing (test_vix_session.py and test_vix_executor.py rewritten for a fake Alpaca
+  client; new OCC-parser and fetch_positions() coverage added to test_vix_positions.py).
 - 2026-08-19: Closed the option pnl_pct gap — vix_positions.py option positions carried pnl_pct=None
   since the scaffold's first commit, which meant decide_option_management() could never propose
   ROLL_OPTION/CLOSE_OPTION (it skips positions with pnl_pct is None) and unrealized P&L was scoped
