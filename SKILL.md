@@ -304,6 +304,7 @@ if "access_token" in new and "refresh_token" in new:
 ---
 
 ## Lessons learned
+- 2026-08-19: Clean daily run. Macro REDUCED (score 61.5), no alerts fired, no news available — confirms that missing news highlights do not block the batch loop from completing normally.
 - 2026-08-18: Clean daily run. Macro REDUCED (score: 56.0/100), no alerts fired; score remains in the 53–57 range for the second confirmed post-recovery session, suggesting the pipeline is stable but macro posture continues to warrant a cautious reduced stance until the score sustains above 60 across multiple sessions.
 - 2026-08-17: Clean daily run. Macro REDUCED (score: 64.5/100), no alerts fired; score remains comfortably above the 60-threshold boundary, continuing the stable REDUCED posture streak first established after pipeline recovery — no action required.
 - 2026-08-14: Clean daily run. Macro REDUCED (score: 69.3/100), no alerts fired; score remains well above the 60-point threshold with 1 held position and 10 watchlist tickers monitored — confirms stable system operation, though the elevated REDUCED posture warrants continued attention if the score climbs toward NEUTRAL or higher in coming sessions.
@@ -405,4 +406,5 @@ already; see root repo git history for the fix).
   returns.
 
 ### VIX Trader — Lessons learned
+- 2026-08-19: posture=SVIX_ON, VIX=18.23, session=HEALTHY, actions=1, executed=0, paper_signals=2
 - 2026-08-19: posture=SVIX_ON, VIX=18.23, session=HEALTHY, actions=1, executed=0, paper_signals=1

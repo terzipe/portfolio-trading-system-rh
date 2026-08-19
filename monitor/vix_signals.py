@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from data.unusual_whales import UWError
 from monitor.vix_regime import SVIX_ON, LONG_VOL_TACTICAL, FADE_SPIKE_PUTS, CASH, FLATTEN_SVIX
 
 SELL_SVIX_ALL = "SELL_SVIX_ALL"
@@ -37,6 +38,34 @@ def _held(positions: list[dict], ticker: str, pos_type: str | None = None) -> li
         p for p in positions
         if p.get("ticker") == ticker and (pos_type is None or p.get("type") == pos_type)
     ]
+
+
+def fetch_uvxy_history(uw_client, sessions: int = 10) -> list[float] | None:
+    """
+    Last `sessions` UVXY regular-session daily closes (oldest first), for
+    evaluate_fade_spike()'s window (SRS §7.5: "UVXY +30% in <=10
+    sessions"). Confirmed live 2026-08-19: GET /api/stock/UVXY/ohlc/1d
+    returns one row per session *segment* per day (market_time: "pr"
+    pre-market / "r" regular / "po" post-market), not one row per day — a
+    naive "last N rows" would mix pre/post segments and undercount actual
+    trading days, so this filters to market_time=="r" before taking the
+    tail. Returns None on any fetch/parse failure or too few closes — fail
+    closed, matching evaluate_fade_spike()'s own None-history contract (no
+    fade-spike entry without confirming data, per SRS §6.4).
+    """
+    try:
+        payload = uw_client.ohlc("UVXY", candle_size="1d")
+    except UWError:
+        return None
+    rows = payload.get("data", [])
+    regular = [r for r in rows if r.get("market_time") == "r"]
+    closes: list[float] = []
+    for row in regular[-sessions:]:
+        try:
+            closes.append(float(row["close"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return closes if len(closes) >= 2 else None
 
 
 def evaluate_fade_spike(uw_client, vix: float | None, uvxy_history: list[float] | None = None) -> bool:

@@ -24,8 +24,9 @@ from datetime import date, datetime
 
 from config import (
     VIX_ACCOUNT, VIX_STATE_FILE, VIX_SLEEVE_MAX_PCT, VIX_SVIX_MAX_PCT,
-    VIX_KILL_SWITCH, ENABLE_VIX_AUTO_SELL, ENABLE_VIX_AUTO_BUY,
+    VIX_MAX_CONTRACTS, VIX_KILL_SWITCH, ENABLE_VIX_AUTO_SELL, ENABLE_VIX_AUTO_BUY,
 )
+from monitor import vix_options
 from monitor.layer0_universe import _AGENTIC_ACCOUNT, _MARGIN_ACCOUNT
 from monitor.vix_session import SessionResult, HEALTHY, can_flatten, can_buy
 from monitor.vix_signals import (
@@ -77,13 +78,18 @@ def _entry_locked(state: dict) -> bool:
     return state.get("last_entry_session") == _session_id()
 
 
-def _poll_order_confirmed(rh, order_id: str, timeout: float = 20.0) -> bool:
+def _poll_order_confirmed(rh, order_id: str, is_option: bool = False, timeout: float = 20.0) -> bool:
     """After every order, poll status; caller stops the cycle if unconfirmed
-    (no second market order same cycle) — SRS §8.5."""
+    (no second market order same cycle) — SRS §8.5. robin_stocks uses a
+    distinct lookup for option orders (get_option_order_info) vs equity
+    orders (get_stock_order_info) — calling the wrong one for CLOSE_OPTION
+    or a BUY_*_PUT/CALL fill would silently mis-report every option order
+    as unconfirmed."""
+    lookup = rh.get_option_order_info if is_option else rh.get_stock_order_info
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            info = rh.get_stock_order_info(order_id) if order_id else None
+            info = lookup(order_id) if order_id else None
         except Exception:  # noqa: BLE001
             info = None
         state = (info or {}).get("state")
@@ -100,6 +106,68 @@ def _sleeve_pct_ok(current_mv: float, proposed_mv: float, nav: float, svix_only:
         return False
     cap = VIX_SVIX_MAX_PCT if svix_only else VIX_SLEEVE_MAX_PCT
     return (current_mv + proposed_mv) / nav <= cap
+
+
+def _size_svix_shares(nav: float, sleeve_mv: float, price: float) -> tuple[int, float]:
+    """
+    Target dollar allocation is the tighter of VIX_SVIX_MAX_PCT (SVIX alone)
+    and whatever headroom remains under VIX_SLEEVE_MAX_PCT (all vol
+    products combined, including any held VXX/UVXY options). Only called
+    when entering fresh — vix_signals.decide_actions() only proposes
+    BUY_SVIX_SHARES when no SVIX is currently held (SRS §7.7/§8.5) — so the
+    SVIX cap alone, not current_svix_mv + proposed, bounds it directly.
+    Rounds down; a target that can't afford even one share returns (0, 0.0)
+    rather than rounding up past either cap.
+    """
+    if nav <= 0 or price <= 0:
+        return 0, 0.0
+    svix_cap_mv = VIX_SVIX_MAX_PCT * nav
+    sleeve_headroom_mv = max(0.0, VIX_SLEEVE_MAX_PCT * nav - sleeve_mv)
+    target_mv = min(svix_cap_mv, sleeve_headroom_mv)
+    quantity = int(target_mv // price)
+    return quantity, quantity * price
+
+
+def _size_option_contracts(nav: float, sleeve_mv: float, premium_per_contract: float) -> int:
+    """
+    UVXY/VXX puts and calls are not SVIX, so only the general sleeve cap
+    applies (VIX_SVIX_MAX_PCT is SVIX-specific) — bounded further by
+    VIX_MAX_CONTRACTS regardless of how much dollar headroom remains.
+    premium_per_contract is dollars per contract (RH Tracker convention:
+    quoted mid * 100), matching vix_positions.py's cost_basis convention.
+    Rounds down; refuses (0) rather than exceeding either cap.
+    """
+    if nav <= 0 or premium_per_contract <= 0:
+        return 0
+    sleeve_headroom_mv = max(0.0, VIX_SLEEVE_MAX_PCT * nav - sleeve_mv)
+    by_headroom = int(sleeve_headroom_mv // premium_per_contract)
+    return max(0, min(VIX_MAX_CONTRACTS, by_headroom))
+
+
+def _size_and_explain_option(contract, nav: float, sleeve_mv: float) -> tuple[int, float, str]:
+    """
+    Shared by the put and call entry branches. Returns (quantity,
+    proposed_mv, skip_reason) — skip_reason is "" iff quantity > 0.
+    Zero-premium contracts (bid=ask=0, e.g. a thin fallback strike with no
+    real market — hit live 2026-08-19 on a VXX put fallback) get their own
+    message: "exceeds sleeve headroom" would be actively misleading there,
+    since more NAV wouldn't fix an untradeable quote.
+    """
+    premium = contract.mid * 100
+    if premium <= 0:
+        return 0, 0.0, (
+            f"{contract.ticker} {contract.expiry} {contract.strike}{contract.option_type[0]} "
+            f"has no real market (bid=${contract.bid:.2f}, ask=${contract.ask:.2f}) — refusing to size a trade on it"
+        )
+    quantity = _size_option_contracts(nav, sleeve_mv, premium)
+    proposed_mv = quantity * premium
+    if quantity <= 0:
+        return 0, 0.0, (
+            f"sized to 0 contracts — {contract.ticker} {contract.expiry} {contract.strike}"
+            f"{contract.option_type[0]} at ${premium:.0f}/contract exceeds sleeve headroom or "
+            f"VIX_MAX_CONTRACTS={VIX_MAX_CONTRACTS} (NAV=${nav:.2f}, sleeve_mv=${sleeve_mv:.2f})"
+        )
+    return quantity, proposed_mv, ""
 
 
 def execute_actions(
@@ -169,7 +237,7 @@ def execute_actions(
                 if not dry_run:
                     _save_state(state)
                 if outcome.executed:
-                    confirmed = _poll_order_confirmed(rh, outcome.order_id)
+                    confirmed = _poll_order_confirmed(rh, outcome.order_id, is_option=(action.action == CLOSE_OPTION))
                     if not confirmed:
                         outcomes[-1].skip_reason = "order unconfirmed — stopping cycle, no second market order"
                         break
@@ -190,13 +258,57 @@ def execute_actions(
                 continue
 
             price = quote_fn(action.ticker) if action.ticker else None
-            proposed_mv = 0.0  # sized by caller before calling this in a real S3 build; scaffold logs intent
+            quantity = None
+            contract = None
+
+            if action.action == BUY_SVIX_SHARES:
+                if price is None or price <= 0:
+                    outcomes.append(ExecutionOutcome(action, False, skip_reason="no price to size SVIX buy"))
+                    continue
+                quantity, proposed_mv = _size_svix_shares(nav, sleeve_mv, price)
+                if quantity <= 0:
+                    outcomes.append(ExecutionOutcome(
+                        action, False,
+                        skip_reason=(
+                            f"sized to 0 shares — target allocation ${proposed_mv:.2f} at ${price:.2f}/share "
+                            f"rounds down to 0 (NAV=${nav:.2f}, sleeve_mv=${sleeve_mv:.2f}, "
+                            f"caps: SVIX {VIX_SVIX_MAX_PCT:.0%}, sleeve {VIX_SLEEVE_MAX_PCT:.0%})"
+                        ),
+                    ))
+                    continue
+
+            elif action.action in (BUY_UVXY_PUT, BUY_VXX_PUT):
+                if price is None or price <= 0:
+                    outcomes.append(ExecutionOutcome(action, False, skip_reason=f"no spot price for {action.ticker} to pick a put"))
+                    continue
+                contract = vix_options.pick_put(spot_price=price)
+                if contract is None:
+                    outcomes.append(ExecutionOutcome(action, False, skip_reason="no liquid UVXY/VXX put found in 10-21 DTE window"))
+                    continue
+                quantity, proposed_mv, size_reason = _size_and_explain_option(contract, nav, sleeve_mv)
+                if quantity <= 0:
+                    outcomes.append(ExecutionOutcome(action, False, skip_reason=size_reason))
+                    continue
+
+            elif action.action in (BUY_VXX_CALL, BUY_UVXY_CALL):
+                contract = vix_options.pick_call(ticker=action.ticker)
+                if contract is None:
+                    outcomes.append(ExecutionOutcome(action, False, skip_reason=f"no liquid {action.ticker} call found in 21-45 DTE, delta 0.40-0.60 window"))
+                    continue
+                quantity, proposed_mv, size_reason = _size_and_explain_option(contract, nav, sleeve_mv)
+                if quantity <= 0:
+                    outcomes.append(ExecutionOutcome(action, False, skip_reason=size_reason))
+                    continue
+
+            else:
+                proposed_mv = 0.0
+
             svix_only = action.action == BUY_SVIX_SHARES
             if not _sleeve_pct_ok(sleeve_mv, proposed_mv, nav, svix_only=svix_only):
                 outcomes.append(ExecutionOutcome(action, False, skip_reason="sleeve % cap would be exceeded"))
                 continue
 
-            outcome = _execute_entry(rh, action, account_number, price, dry_run=dry_run)
+            outcome = _execute_entry(rh, action, account_number, price, quantity=quantity, contract=contract, dry_run=dry_run)
             outcomes.append(outcome)
             if outcome.executed or outcome.would_execute:
                 orders_this_cycle += 1
@@ -204,7 +316,7 @@ def execute_actions(
                 if not dry_run:
                     _save_state(state)
                 if outcome.executed:
-                    confirmed = _poll_order_confirmed(rh, outcome.order_id)
+                    confirmed = _poll_order_confirmed(rh, outcome.order_id, is_option=(action.action != BUY_SVIX_SHARES))
                     if not confirmed:
                         outcomes[-1].skip_reason = "order unconfirmed — stopping cycle, no second market order"
                         break
@@ -262,24 +374,61 @@ def _execute_flatten(rh, action: Action, account_number: str, dry_run: bool = Fa
         return ExecutionOutcome(action, False, skip_reason=f"order failed: {exc}")
 
 
-def _execute_entry(rh, action: Action, account_number: str, price: float | None, dry_run: bool = False) -> ExecutionOutcome:
+def _execute_entry(
+    rh, action: Action, account_number: str, price: float | None,
+    quantity: int | None = None, contract=None, dry_run: bool = False,
+) -> ExecutionOutcome:
     try:
         if action.action == BUY_SVIX_SHARES:
             if price is None or price <= 0:
                 return ExecutionOutcome(action, False, skip_reason="no price to size SVIX buy")
-            # Scaffold: quantity sizing (nav * cap / price) is the caller's
-            # job once real position sizing is wired in S3 — placeholder
-            # of 0 shares intentionally refuses to submit (or preview) an
-            # order until that's implemented, fail-closed rather than
-            # guessing a size. dry_run does not change this — there is
-            # nothing meaningful to preview yet.
-            return ExecutionOutcome(action, False, skip_reason="position sizing not wired yet (S3 TODO) — refusing to guess quantity")
+            if not quantity or quantity <= 0:
+                # Caller (execute_actions) is expected to have already
+                # refused a 0-quantity size with a detailed reason before
+                # reaching here — this is a defensive fallback, not the
+                # primary path.
+                return ExecutionOutcome(action, False, skip_reason="sized to 0 shares — refusing to submit")
+            preview = {
+                "call": "order_buy_market", "symbol": action.ticker, "quantity": quantity,
+                "account_number": account_number, "timeInForce": _TIME_IN_FORCE,
+            }
+            if dry_run:
+                return ExecutionOutcome(
+                    action, False, would_execute=True, order_preview=preview, dry_run=True,
+                    skip_reason="DRY RUN — order not submitted",
+                )
+            resp = rh.order_buy_market(
+                action.ticker, quantity, account_number=account_number, timeInForce=_TIME_IN_FORCE
+            )
+            return ExecutionOutcome(action, True, would_execute=True, order_preview=preview, order_id=(resp or {}).get("id"))
 
-        # Options entries (BUY_UVXY_PUT / BUY_VXX_PUT / BUY_VXX_CALL / BUY_UVXY_CALL)
-        # require a ContractPick from vix_options — caller is expected to
-        # have run vix_options.pick_put()/pick_call() and attached it to
-        # the Action before calling execute_actions(). Scaffold refuses to
-        # guess a contract, dry_run or not.
-        return ExecutionOutcome(action, False, skip_reason="option contract not attached to action (S3 TODO)")
+        if action.action in (BUY_UVXY_PUT, BUY_VXX_PUT, BUY_VXX_CALL, BUY_UVXY_CALL):
+            if contract is None or not quantity or quantity <= 0:
+                # Caller is expected to have already refused with a detailed
+                # reason (no liquid contract found, or sized to 0) before
+                # reaching here — defensive fallback, not the primary path.
+                return ExecutionOutcome(action, False, skip_reason="no contract/quantity to submit — refusing")
+            # Pay the ask on a buy-to-open — a marketable limit, not a
+            # market order (SRS: never 0-DTE / defined-risk options only,
+            # a naked market order on an option is not that).
+            preview = {
+                "call": "order_buy_option_limit", "position_effect": "open", "credit_or_debit": "debit",
+                "price": contract.ask, "symbol": contract.ticker, "quantity": quantity,
+                "expiry": contract.expiry, "strike": contract.strike, "option_type": contract.option_type,
+                "account_number": account_number, "timeInForce": _TIME_IN_FORCE,
+            }
+            if dry_run:
+                return ExecutionOutcome(
+                    action, False, would_execute=True, order_preview=preview, dry_run=True,
+                    skip_reason="DRY RUN — order not submitted",
+                )
+            resp = rh.order_buy_option_limit(
+                "open", "debit", contract.ask, contract.ticker, quantity,
+                contract.expiry, contract.strike, contract.option_type,
+                account_number=account_number, timeInForce=_TIME_IN_FORCE,
+            )
+            return ExecutionOutcome(action, True, would_execute=True, order_preview=preview, order_id=(resp or {}).get("id"))
+
+        return ExecutionOutcome(action, False, skip_reason="unrecognized entry action")
     except Exception as exc:  # noqa: BLE001
         return ExecutionOutcome(action, False, skip_reason=f"order failed: {exc}")

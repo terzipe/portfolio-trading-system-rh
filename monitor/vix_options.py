@@ -36,6 +36,32 @@ def _dte(expiry: str) -> int:
     return (exp_date - date.today()).days
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    """UW returns nbbo_bid/nbbo_ask/strike as JSON null (not just absent or
+    "0") for some illiquid strikes — confirmed live 2026-08-19 on a real
+    UVXY put chain, which crashed float(None) before this existed.
+    contract.get(key, default) only substitutes default when the key is
+    *missing*, not when it's present with value None, so this can't be
+    fixed by tweaking .get() defaults alone."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _optional_float(value) -> float | None:
+    """Same null-tolerance as _safe_float, but for fields like delta where
+    None is a meaningful "unknown", not a fallback to 0.0."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _spread_pct(bid: float, ask: float) -> float:
     mid = (bid + ask) / 2
     if mid <= 0:
@@ -46,7 +72,7 @@ def _spread_pct(bid: float, ask: float) -> float:
 def _is_liquid(contract: dict) -> bool:
     # Field names confirmed against a live UVXY option-chains pull
     # 2026-08-18: nbbo_bid / nbbo_ask (not bid/ask).
-    bid, ask = float(contract.get("nbbo_bid", 0)), float(contract.get("nbbo_ask", 0))
+    bid, ask = _safe_float(contract.get("nbbo_bid")), _safe_float(contract.get("nbbo_ask"))
     oi = contract.get("open_interest")
     if _spread_pct(bid, ask) > _WIDE_SPREAD_THRESHOLD:
         return False
@@ -94,18 +120,17 @@ def pick_put(spot_price: float, primary_ticker: str = "UVXY", fallback_ticker: s
         candidates = _candidates(chain, "put", VIX_MIN_DTE, VIX_MAX_DTE)
         if not candidates:
             continue
-        candidates.sort(key=lambda c: abs(float(c.get("strike", 0)) - target_strike))
+        candidates.sort(key=lambda c: abs(_safe_float(c.get("strike")) - target_strike))
         best = candidates[0]
         if not _is_liquid(best) and not is_fallback:
             continue  # try VXX fallback
-        bid, ask = float(best.get("nbbo_bid", 0)), float(best.get("nbbo_ask", 0))
-        delta = best.get("delta")
+        bid, ask = _safe_float(best.get("nbbo_bid")), _safe_float(best.get("nbbo_ask"))
         return ContractPick(
             ticker=ticker, option_type="put",
-            strike=float(best.get("strike", 0)),
+            strike=_safe_float(best.get("strike")),
             expiry=best["expiry"], dte=best["dte"],
             bid=bid, ask=ask, mid=(bid + ask) / 2,
-            delta=float(delta) if delta is not None else None,
+            delta=_optional_float(best.get("delta")),
             open_interest=best.get("open_interest"),
             fallback=is_fallback,
         )
@@ -122,22 +147,21 @@ def pick_call(ticker: str = "VXX", delta_range: tuple[float, float] = (0.40, 0.6
 
     candidates = _candidates(chain, "call", VIX_CALL_MIN_DTE, VIX_CALL_MAX_DTE)
     lo, hi = delta_range
-    in_range = [c for c in candidates if c.get("delta") is not None and lo <= float(c["delta"]) <= hi]
+    in_range = [c for c in candidates if _optional_float(c.get("delta")) is not None and lo <= _optional_float(c["delta"]) <= hi]
     pool = in_range or candidates
     if not pool:
         return None
 
     mid_target = (lo + hi) / 2
-    pool.sort(key=lambda c: abs(float(c.get("delta", mid_target)) - mid_target))
+    pool.sort(key=lambda c: abs((_optional_float(c.get("delta")) or mid_target) - mid_target))
     best = pool[0]
-    bid, ask = float(best.get("nbbo_bid", 0)), float(best.get("nbbo_ask", 0))
-    delta = best.get("delta")
+    bid, ask = _safe_float(best.get("nbbo_bid")), _safe_float(best.get("nbbo_ask"))
     return ContractPick(
         ticker=ticker, option_type="call",
-        strike=float(best.get("strike", 0)),
+        strike=_safe_float(best.get("strike")),
         expiry=best["expiry"], dte=best["dte"],
         bid=bid, ask=ask, mid=(bid + ask) / 2,
-        delta=float(delta) if delta is not None else None,
+        delta=_optional_float(best.get("delta")),
         open_interest=best.get("open_interest"),
         fallback=False,
     )
