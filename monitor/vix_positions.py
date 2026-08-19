@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from config import VIX_ACCOUNT
 from data.unusual_whales import get_client
+from monitor import vix_options
 from monitor.layer0_universe import _AGENTIC_ACCOUNT, _MARGIN_ACCOUNT
 
 _ACCOUNT_NUMBERS = {"AGENTIC": _AGENTIC_ACCOUNT, "MARGIN": _MARGIN_ACCOUNT}
@@ -66,15 +67,29 @@ def fetch_positions(rh) -> list[dict]:
         if contracts <= 0:
             continue
         cost_basis = float(p.get("average_open_price", 0)) * 100  # $/contract, RH Tracker convention
+        expiry = p.get("expiration_date")
+        strike = float(p.get("strike_price", 0))
+        option_type = p.get("type")
+
+        # Live mark, closing the gap that used to leave pnl_pct permanently
+        # None for every option position — that blocked ROLL_OPTION/
+        # CLOSE_OPTION from ever firing (decide_option_management() skips
+        # positions with pnl_pct is None) and kept unrealized P&L scoped to
+        # shares only. Fails closed (mid_price/pnl_pct stay None) if the
+        # chain fetch fails or no exact contract match is found — never
+        # guesses a mark.
+        mark_per_share = vix_options.get_contract_mark(chain_symbol, expiry, strike, option_type)
+        mid_price = None
+        pnl_pct = None
+        if mark_per_share is not None and cost_basis:
+            mid_price = mark_per_share * 100  # $/contract, matching cost_basis's convention
+            pnl_pct = (mid_price - cost_basis) / cost_basis
+
         out.append({
             "ticker": chain_symbol, "type": "option",
             "contracts": contracts, "cost_basis": cost_basis,
-            "expiry": p.get("expiration_date"), "strike": float(p.get("strike_price", 0)),
-            "option_type": p.get("type"),
-            # pnl_pct left unset here — needs a live option mark from UW
-            # option_chain(), wired by the caller once it has the chain
-            # for roll/stop evaluation (vix_signals.decide_option_management).
-            "pnl_pct": None,
+            "expiry": expiry, "strike": strike, "option_type": option_type,
+            "mid_price": mid_price, "pnl_pct": pnl_pct,
         })
 
     return out
@@ -82,27 +97,29 @@ def fetch_positions(rh) -> list[dict]:
 
 def unrealized_pnl(positions: list[dict]) -> dict:
     """
-    Unrealized P&L on current holdings, scoped to shares (SVIX) only —
-    option positions' pnl_pct is always None above (no live option mark
-    wired yet), so option unrealized P&L isn't reliably computable until
-    that gap is closed. Shared by both loop_daily_vix.py and
-    loop_intraday_vix.py so the calculation lives in exactly one place.
+    Unrealized P&L on current holdings — shares and options both, now that
+    option positions carry a real mid_price/pnl_pct (see get_contract_mark()
+    above). cost_basis and mid_price are both already in "dollars per unit"
+    terms for both position types (per-share for shares, per-contract for
+    options — the RH Tracker convention), so (mid - cost) * qty works
+    uniformly; only the quantity key name differs (quantity vs contracts).
+    Shared by both loop_daily_vix.py and loop_intraday_vix.py so the
+    calculation lives in exactly one place.
     """
     total_dollars = 0.0
     total_cost = 0.0
     by_ticker: dict[str, dict] = {}
     for p in positions:
-        if p.get("type") != "share":
-            continue
-        qty = p.get("quantity", 0)
+        qty = p.get("quantity") if p.get("type") == "share" else p.get("contracts")
         cost = p.get("cost_basis", 0)
         mid = p.get("mid_price")
-        if mid is None or qty <= 0:
+        if mid is None or not qty or qty <= 0:
             continue
         dollars = (mid - cost) * qty
         total_dollars += dollars
         total_cost += cost * qty
-        by_ticker[p["ticker"]] = {
+        key = p["ticker"] if p.get("type") == "share" else f"{p['ticker']} {p.get('expiry')} {p.get('strike')}{(p.get('option_type') or '?')[0]}"
+        by_ticker[key] = {
             "dollars": dollars, "pct": (mid / cost - 1) if cost else None,
             "quantity": qty, "cost_basis": cost, "mid_price": mid,
         }

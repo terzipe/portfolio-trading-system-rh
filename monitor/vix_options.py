@@ -104,6 +104,45 @@ def _candidates(chain: dict, option_type: str, min_dte: int, max_dte: int) -> li
     return out
 
 
+def get_contract_mark(ticker: str, expiry: str, strike: float, option_type: str) -> float | None:
+    """
+    Live mid-price mark (dollars per *share*, not per contract — caller
+    multiplies by 100 to match the RH Tracker cost_basis convention) for a
+    specific held contract. Used by vix_positions.py to compute pnl_pct
+    for option positions — previously always None, which meant
+    ROLL_OPTION/CLOSE_OPTION could never fire (SRS §9 needs a real pnl_pct)
+    and unrealized P&L was scoped to shares only.
+
+    Matches on expiry (exact string) + strike (float, small tolerance for
+    representation drift) + option_type. Returns None — fail closed, never
+    guess — if the chain fetch fails, no exact match is found, or the
+    matched contract has no real market (bid=ask=0, same "no real market"
+    condition _size_and_explain_option() guards on the entry path).
+    """
+    uw = get_client()
+    try:
+        chain = uw.option_chain(ticker, greeks=True)
+    except UWError:
+        return None
+
+    rows = chain.get("data", [])
+    if not rows or not isinstance(rows[0], dict):
+        return None
+
+    for c in rows:
+        if c.get("option_type") != option_type:
+            continue
+        if c.get("expires") != expiry:
+            continue
+        if abs(_safe_float(c.get("strike")) - strike) > 0.01:
+            continue
+        bid, ask = _safe_float(c.get("nbbo_bid")), _safe_float(c.get("nbbo_ask"))
+        mid = (bid + ask) / 2
+        return mid if mid > 0 else None
+
+    return None
+
+
 def pick_put(spot_price: float, primary_ticker: str = "UVXY", fallback_ticker: str = "VXX") -> ContractPick | None:
     """
     10-21 DTE, ~10% OTM to slightly ITM. UVXY primary; falls back to VXX

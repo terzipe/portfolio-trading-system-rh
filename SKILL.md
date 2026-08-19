@@ -408,6 +408,13 @@ already; see root repo git history for the fix).
   returns.
 
 ### VIX Trader — Lessons learned
+- 2026-08-19: Closed the option pnl_pct gap — vix_positions.py option positions carried pnl_pct=None
+  since the scaffold's first commit, which meant decide_option_management() could never propose
+  ROLL_OPTION/CLOSE_OPTION (it skips positions with pnl_pct is None) and unrealized P&L was scoped
+  to shares only. Added vix_options.get_contract_mark() (live UW chain lookup by exact
+  expiry/strike/option_type match, fail-closed to None on no match or a zero-premium contract) and
+  wired it into fetch_positions(). Live-verified against a real current UVXY contract. 6 new tests
+  for get_contract_mark() + 4 for unrealized_pnl() (previously untested), 72/72 passing.
 - 2026-08-19: posture=SVIX_ON, VIX=17.7, session=HEALTHY, actions=1, executed=0, paper_signals=12
 - 2026-08-19: posture=SVIX_ON, VIX=17.73, session=HEALTHY, actions=1, executed=0, paper_signals=9
 - 2026-08-19: posture=SVIX_ON, VIX=17.77, session=HEALTHY, actions=1, executed=1, paper_signals=8
