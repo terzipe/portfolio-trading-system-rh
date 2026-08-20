@@ -28,7 +28,7 @@ from config import (
     VIX_MAX_CONTRACTS, VIX_KILL_SWITCH, ENABLE_VIX_AUTO_SELL, ENABLE_VIX_AUTO_BUY,
     ENABLE_VIX_AUTO_ROLL,
 )
-from monitor import vix_options
+from monitor import vix_kill_switch, vix_options
 from monitor.vix_session import SessionResult, HEALTHY, can_flatten, can_buy
 from monitor.vix_signals import (
     Action, SELL_SVIX_ALL, BUY_SVIX_SHARES, BUY_UVXY_PUT, BUY_VXX_PUT,
@@ -230,8 +230,10 @@ def execute_actions(
         is_entry = action.action in (BUY_SVIX_SHARES, BUY_UVXY_PUT, BUY_VXX_PUT, BUY_VXX_CALL, BUY_UVXY_CALL)
         is_roll = action.action == ROLL_OPTION
 
-        if VIX_KILL_SWITCH and not is_flatten:
-            outcomes.append(ExecutionOutcome(action, False, skip_reason="VIX_KILL_SWITCH=true — flatten-only"))
+        auto_tripped = vix_kill_switch.is_tripped()
+        if (VIX_KILL_SWITCH or auto_tripped) and not is_flatten:
+            reason = "VIX_KILL_SWITCH=true" if VIX_KILL_SWITCH else "auto kill switch tripped (SVIX P&L stop)"
+            outcomes.append(ExecutionOutcome(action, False, skip_reason=f"{reason} — flatten-only"))
             continue
 
         if is_flatten:
@@ -394,7 +396,20 @@ def _execute_flatten(client, action: Action, dry_run: bool = False) -> Execution
         if action.action == CLOSE_OPTION and action.position:
             pos = action.position
             occ = _occ_symbol(pos["ticker"], pos["expiry"], pos["strike"], pos["option_type"])
-            limit_price = round(pos.get("mid_price", pos.get("cost_basis", 0)) / 100, 2)
+            # Re-quote right before submission and price at the live bid —
+            # a limit built from pos["mid_price"] (captured whenever
+            # fetch_positions() last ran, not at submission time) can sit
+            # stale on a thin contract: observed live 2026-08-20, a real
+            # 6x-wide $0.02/$0.14 spread left a mid-derived close order
+            # unfilled. Falls back to the old stale-mark price only if a
+            # fresh quote can't be fetched — closes/rolls stay exempt from
+            # ever being flat-out refused, same reason they're exempt from
+            # the kill switch.
+            fresh_quote = vix_options.get_contract_quote(pos["ticker"], pos["expiry"], pos["strike"], pos["option_type"])
+            if fresh_quote is not None and fresh_quote[0] > 0:
+                limit_price = round(fresh_quote[0], 2)
+            else:
+                limit_price = round(pos.get("mid_price", pos.get("cost_basis", 0)) / 100, 2)
             qty = pos.get("contracts", 1)
             preview = {
                 "call": "submit_order", "order_type": "limit", "symbol": occ,

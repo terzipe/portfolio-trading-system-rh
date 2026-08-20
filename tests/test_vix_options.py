@@ -79,6 +79,50 @@ def test_get_contract_mark_tolerates_strike_float_representation_drift(monkeypat
     assert vix_options.get_contract_mark("UVXY", "2099-01-15", 54.0, "put") == 1.15
 
 
+def test_get_contract_quote_finds_exact_match(monkeypatch):
+    chain = {"data": [
+        {"expires": "2099-01-15", "strike": "54", "option_type": "put", "nbbo_bid": "1.10", "nbbo_ask": "1.20"},
+    ]}
+    monkeypatch.setattr(vix_options, "get_client", lambda: _FakeUW(chain))
+
+    assert vix_options.get_contract_quote("UVXY", "2099-01-15", 54.0, "put") == (1.10, 1.20)
+
+
+def test_get_contract_quote_none_when_no_match(monkeypatch):
+    chain = {"data": [
+        {"expires": "2099-01-15", "strike": "54", "option_type": "put", "nbbo_bid": "1.10", "nbbo_ask": "1.20"},
+    ]}
+    monkeypatch.setattr(vix_options, "get_client", lambda: _FakeUW(chain))
+
+    assert vix_options.get_contract_quote("UVXY", "2099-01-15", 60.0, "put") is None
+
+
+def test_get_contract_quote_none_on_chain_fetch_failure(monkeypatch):
+    from data.unusual_whales import UWError
+
+    class _FailingUW:
+        def option_chain(self, ticker, greeks=True):
+            raise UWError("boom")
+
+    monkeypatch.setattr(vix_options, "get_client", lambda: _FailingUW())
+
+    assert vix_options.get_contract_quote("UVXY", "2099-01-15", 54.0, "put") is None
+
+
+def test_get_contract_quote_returns_raw_zero_premium_not_none(monkeypatch):
+    # Unlike get_contract_mark() (which treats a zero-premium match as "no
+    # mark"), get_contract_quote() returns the raw (0.0, 0.0) for a real
+    # match with no market -- callers decide what that means for their own
+    # use (e.g. vix_executor's close-leg re-quote falls back to a stale
+    # price rather than submitting a $0.00 limit order).
+    chain = {"data": [
+        {"expires": "2099-01-15", "strike": "18", "option_type": "put", "nbbo_bid": "0", "nbbo_ask": "0"},
+    ]}
+    monkeypatch.setattr(vix_options, "get_client", lambda: _FakeUW(chain))
+
+    assert vix_options.get_contract_quote("VXX", "2099-01-15", 18.0, "put") == (0.0, 0.0)
+
+
 def test_get_contract_mark_against_real_captured_chain():
     """Integration-style: use the real UVXY chain fixture captured live
     2026-08-18, confirm a known real contract is found correctly."""

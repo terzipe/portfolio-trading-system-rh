@@ -104,20 +104,16 @@ def _candidates(chain: dict, option_type: str, min_dte: int, max_dte: int) -> li
     return out
 
 
-def get_contract_mark(ticker: str, expiry: str, strike: float, option_type: str) -> float | None:
+def get_contract_quote(ticker: str, expiry: str, strike: float, option_type: str) -> tuple[float, float] | None:
     """
-    Live mid-price mark (dollars per *share*, not per contract — caller
-    multiplies by 100 to match the RH Tracker cost_basis convention) for a
-    specific held contract. Used by vix_positions.py to compute pnl_pct
-    for option positions — previously always None, which meant
-    ROLL_OPTION/CLOSE_OPTION could never fire (SRS §9 needs a real pnl_pct)
-    and unrealized P&L was scoped to shares only.
-
-    Matches on expiry (exact string) + strike (float, small tolerance for
+    Live (bid, ask) — dollars per *share* — for a specific contract. Matches
+    on expiry (exact string) + strike (float, small tolerance for
     representation drift) + option_type. Returns None — fail closed, never
-    guess — if the chain fetch fails, no exact match is found, or the
-    matched contract has no real market (bid=ask=0, same "no real market"
-    condition _size_and_explain_option() guards on the entry path).
+    guess — only if the chain fetch fails or no exact match is found; a
+    matched contract with no real market (bid=ask=0) still returns (0.0,
+    0.0) so callers can decide what that means for their own use (e.g.
+    get_contract_mark() below treats it as "no mark", but a caller pricing
+    a close order might instead want to fall back to a different price).
     """
     uw = get_client()
     try:
@@ -136,11 +132,31 @@ def get_contract_mark(ticker: str, expiry: str, strike: float, option_type: str)
             continue
         if abs(_safe_float(c.get("strike")) - strike) > 0.01:
             continue
-        bid, ask = _safe_float(c.get("nbbo_bid")), _safe_float(c.get("nbbo_ask"))
-        mid = (bid + ask) / 2
-        return mid if mid > 0 else None
+        return _safe_float(c.get("nbbo_bid")), _safe_float(c.get("nbbo_ask"))
 
     return None
+
+
+def get_contract_mark(ticker: str, expiry: str, strike: float, option_type: str) -> float | None:
+    """
+    Live mid-price mark (dollars per *share*, not per contract — caller
+    multiplies by 100 to match the RH Tracker cost_basis convention) for a
+    specific held contract. Used by vix_positions.py to compute pnl_pct
+    for option positions — previously always None, which meant
+    ROLL_OPTION/CLOSE_OPTION could never fire (SRS §9 needs a real pnl_pct)
+    and unrealized P&L was scoped to shares only.
+
+    Thin wrapper over get_contract_quote() — returns None if the quote
+    fetch/match fails, or if the matched contract has no real market
+    (bid=ask=0, same "no real market" condition _size_and_explain_option()
+    guards on the entry path).
+    """
+    quote = get_contract_quote(ticker, expiry, strike, option_type)
+    if quote is None:
+        return None
+    bid, ask = quote
+    mid = (bid + ask) / 2
+    return mid if mid > 0 else None
 
 
 def pick_put(spot_price: float, primary_ticker: str = "UVXY", fallback_ticker: str = "VXX") -> ContractPick | None:

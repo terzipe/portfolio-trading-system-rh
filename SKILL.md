@@ -408,6 +408,44 @@ already; see root repo git history for the fix).
   returns.
 
 ### VIX Trader — Lessons learned
+- 2026-08-20: Wired VIX_SVIX_STOP_PCT (-15%) into a real SVIX P&L-based auto kill switch
+  (monitor/vix_kill_switch.py) — closes the gap VIX_OPERATIONS_GUIDE.md flagged (the constant
+  existed in config since the scaffold's first commit but was never wired into any decision
+  logic). Dynamic, code-tripped state can't live as a static config constant like VIX_KILL_SWITCH,
+  so it persists to its own file (data/vix/auto_kill_switch.json) checked independently by both
+  vix_regime.compute_posture() (forces FLATTEN_SVIX) and vix_executor.execute_actions() (blocks
+  entries/rolls, exempts flattens) — belt and suspenders, same as the manual switch. Manual reset
+  only, by design (CLI one-liner or a new dashboard button) — deliberately does not self-clear if
+  price recovers, since a real stop-out shouldn't silently un-trip. check_and_trip() is skipped
+  entirely during --dry-run in both loop scripts (a real bug caught before it happened: without
+  that guard, a dry-run drill that happened to see a real breach would trip real persisted state,
+  violating the "dry_run leaves no trace" contract every other part of this codebase relies on).
+  Also added loop_intraday_vix.py's missing top-level crash alert (mirrors loop_daily_vix.py's
+  self-contained osascript fallback exactly) — previously only the daily script paged on an
+  uncaught crash; intraday per-cycle errors were silently caught-and-continued with no alert.
+  Live-verified the full chain with synthetic breach data (no real trade needed): trip persists ->
+  compute_posture() returns FLATTEN_SVIX -> execute_actions() refuses a real entry attempt ->
+  reset() clears it. Also caught a stale-module-cache issue in the long-running Streamlit dev
+  process (import error for the new config constant until restarted) — not a code bug, just a
+  reminder that sys.path-imported modules outside Streamlit's own tree don't hot-reload.
+  118/118 tests passing.
+- 2026-08-20: Live-verified CLOSE_OPTION and ROLL_OPTION for real against Alpaca paper, completing
+  the Alpaca migration proof. CLOSE_OPTION: clicked the dashboard's new "Close" button on a real
+  filled VXX put (5x, $17.50 strike) — order submitted correctly, but the first attempt sat unfilled
+  because _execute_flatten()'s limit price comes from the position's mid_price (a UW mark, possibly
+  stale by the time of submission), and the real live bid/ask on this thin/low-volume contract had
+  moved to $0.02/$0.14 — a 6x spread. The order correctly refused to chase a bad fill rather than
+  cross the spread; this is the limit-order safety design working as intended, not a bug. ROLL_OPTION:
+  same pattern on the close leg (filled once resubmitted at the real bid), and the open leg
+  legitimately refused — pick_put()'s replacement contract (UVXY 2026-09-04 17.5p) had bid=ask=$0.00,
+  correctly caught by _execute_roll()'s zero-premium guard, leaving the sleeve flat on that leg
+  rather than doubled or stuck. Net: thin VIX-complex option contracts can have live spreads wide
+  enough that a mark-derived limit price sits unfilled for a while — worth knowing before relying on
+  CLOSE_OPTION/ROLL_OPTION to exit quickly during a real fast-moving VIX spike; a future improvement
+  could re-quote at submission time instead of using the position's last mid_price. Gold-copy
+  fifo_realized_pnl() correctly reconstructed all 4 real fills from this session's testing
+  (SVIX +$52.15, two small option-test losses) = net $51.15, matching Alpaca's own activity feed.
+- 2026-08-20: posture=SVIX_ON, VIX=17.59, session=HEALTHY, actions=1, executed=0, paper_signals=1
 - 2026-08-19: Added monitor/vix_ledger.py — Alpaca "gold copy" balance/P&L (account_snapshot,
   positions_snapshot, fetch_fill_activities, fifo_realized_pnl), sourced from Alpaca's own
   get_account()/get_all_positions()/GET /account/activities instead of the local paper ledger.

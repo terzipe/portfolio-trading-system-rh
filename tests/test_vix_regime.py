@@ -80,6 +80,16 @@ def test_kill_switch_forces_flatten_only(monkeypatch):
     assert any("KILL_SWITCH" in r for r in reasons)
 
 
+def test_auto_kill_switch_tripped_forces_flatten(monkeypatch):
+    monkeypatch.setattr(vix_regime.vix_kill_switch, "is_tripped", lambda: True)
+    posture, bias, reasons = vix_regime.compute_posture(
+        vix=15.0, vix3m=19.0, vx1=None, vx2=None,
+        gate_posture="FULL", gate_score=90, calendar_month=6, data_age_sec=0,
+    )
+    assert posture == vix_regime.FLATTEN_SVIX
+    assert any("auto kill switch" in r for r in reasons)
+
+
 def test_vx1_vx2_takes_priority_over_vix_vix3m_when_both_present():
     # VX1 > VX2 = backwardation on the futures curve, even if VIX < VIX3M
     # would otherwise read contango — CME curve wins once populated.

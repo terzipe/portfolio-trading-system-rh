@@ -331,10 +331,11 @@ def test_live_put_entry_calls_submit_order_with_contract_terms(monkeypatch, tmp_
     client.get_order_by_id.assert_called_once_with("opt123")
 
 
-def test_close_option_flatten_builds_per_share_limit_price_from_per_contract_mid(monkeypatch, tmp_path):
+def test_close_option_falls_back_to_stale_mid_when_no_fresh_quote(monkeypatch, tmp_path):
     state_file = tmp_path / "state.json"
     monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", state_file)
     monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_SELL", True)
+    monkeypatch.setattr(vix_executor.vix_options, "get_contract_quote", lambda ticker, expiry, strike, option_type: None)
 
     client = _fake_client(order_id="close123")
     session = _healthy_session(client)
@@ -356,6 +357,53 @@ def test_close_option_flatten_builds_per_share_limit_price_from_per_contract_mid
     assert req.side.value == "sell"
     assert float(req.limit_price) == 1.15
     client.get_order_by_id.assert_called_once_with("close123")
+
+
+def test_close_option_uses_fresh_bid_when_quote_available(monkeypatch, tmp_path):
+    # Live-observed 2026-08-20: a thin contract's real bid/ask can move
+    # enough between fetch_positions() and order submission that the stale
+    # mid_price sits outside the market and the close never fills. Re-quote
+    # right before submission and price at the live bid instead.
+    monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_SELL", True)
+    monkeypatch.setattr(vix_executor.vix_options, "get_contract_quote", lambda ticker, expiry, strike, option_type: (0.90, 1.30))
+
+    client = _fake_client(order_id="close456")
+    session = _healthy_session(client)
+    position = {
+        "type": "option", "ticker": "UVXY", "contracts": 2, "cost_basis": 230.0,
+        "mid_price": 115.0, "expiry": "2099-01-15", "strike": 54.0, "option_type": "put",
+    }
+    action = Action(CLOSE_OPTION, "UVXY", "test stop", position)
+
+    outcomes = vix_executor.execute_actions([action], session, nav=10000, sleeve_mv=230, quote_fn=lambda t: 60.0, dry_run=False)
+
+    assert outcomes[0].executed is True
+    req = _last_request(client)
+    assert float(req.limit_price) == 0.90  # fresh bid, not the stale mid_price-derived 1.15
+
+
+def test_close_option_falls_back_when_fresh_quote_is_zero_premium(monkeypatch, tmp_path):
+    # get_contract_quote() can return a real match with no market (0.0,
+    # 0.0) rather than None -- that's still "no usable fresh price", so
+    # this must fall back too, not submit a $0.00 limit order.
+    monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_SELL", True)
+    monkeypatch.setattr(vix_executor.vix_options, "get_contract_quote", lambda ticker, expiry, strike, option_type: (0.0, 0.0))
+
+    client = _fake_client(order_id="close789")
+    session = _healthy_session(client)
+    position = {
+        "type": "option", "ticker": "UVXY", "contracts": 2, "cost_basis": 230.0,
+        "mid_price": 115.0, "expiry": "2099-01-15", "strike": 54.0, "option_type": "put",
+    }
+    action = Action(CLOSE_OPTION, "UVXY", "test stop", position)
+
+    outcomes = vix_executor.execute_actions([action], session, nav=10000, sleeve_mv=230, quote_fn=lambda t: 60.0, dry_run=False)
+
+    assert outcomes[0].executed is True
+    req = _last_request(client)
+    assert float(req.limit_price) == 1.15  # fell back to stale mid_price/100
 
 
 # ── Kill switch drill (Impl Plan §11 step 4) ────────────────────────────
@@ -389,6 +437,26 @@ def test_kill_switch_blocks_entries_when_healthy(monkeypatch, tmp_path):
 
     assert outcomes[0].would_execute is False
     assert "VIX_KILL_SWITCH=true" in outcomes[0].skip_reason
+    client.submit_order.assert_not_called()
+
+
+def test_auto_kill_switch_blocks_entries_but_not_flattens(monkeypatch, tmp_path):
+    monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(vix_executor, "VIX_KILL_SWITCH", False)
+    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_BUY", True)
+    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_SELL", True)
+    monkeypatch.setattr(vix_executor.vix_kill_switch, "is_tripped", lambda: True)
+
+    client = _fake_client()
+    session = _healthy_session(client)
+    entry = Action(BUY_SVIX_SHARES, "SVIX", "auto kill switch drill: entry")
+    flatten = Action(SELL_SVIX_ALL, "SVIX", "auto kill switch drill: flatten", {"type": "share", "quantity": 10})
+
+    outcomes = vix_executor.execute_actions([entry, flatten], session, nav=10000, sleeve_mv=250, quote_fn=lambda t: 26.0, dry_run=True)
+
+    assert outcomes[0].would_execute is False
+    assert "auto kill switch tripped" in outcomes[0].skip_reason
+    assert outcomes[1].would_execute is True  # flatten still allowed
     client.submit_order.assert_not_called()
 
 
@@ -460,6 +528,7 @@ def test_dry_run_roll_previews_both_legs(monkeypatch, tmp_path):
     monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_ROLL", True)
     monkeypatch.setattr(vix_executor.vix_options, "pick_put", lambda spot_price, primary_ticker, fallback_ticker: _FRESH_PUT_REPLACEMENT)
+    monkeypatch.setattr(vix_executor.vix_options, "get_contract_quote", lambda *a, **k: None)
 
     client = _fake_client()
     session = _healthy_session(client)
@@ -481,6 +550,7 @@ def test_roll_stops_after_close_if_no_replacement_found(monkeypatch, tmp_path):
     monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_ROLL", True)
     monkeypatch.setattr(vix_executor.vix_options, "pick_put", lambda spot_price, primary_ticker, fallback_ticker: None)
+    monkeypatch.setattr(vix_executor.vix_options, "get_contract_quote", lambda *a, **k: None)
 
     client = _fake_client()
     session = _healthy_session(client)
@@ -498,6 +568,7 @@ def test_roll_refuses_zero_premium_replacement_not_doubled_or_stuck(monkeypatch,
     monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_ROLL", True)
     monkeypatch.setattr(vix_executor.vix_options, "pick_put", lambda spot_price, primary_ticker, fallback_ticker: _ZERO_PREMIUM_REPLACEMENT)
+    monkeypatch.setattr(vix_executor.vix_options, "get_contract_quote", lambda *a, **k: None)
 
     client = _fake_client()
     session = _healthy_session(client)
@@ -518,6 +589,7 @@ def test_live_roll_calls_both_legs_with_unified_order_polling(monkeypatch, tmp_p
     monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", state_file)
     monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_ROLL", True)
     monkeypatch.setattr(vix_executor.vix_options, "pick_put", lambda spot_price, primary_ticker, fallback_ticker: _FRESH_PUT_REPLACEMENT)
+    monkeypatch.setattr(vix_executor.vix_options, "get_contract_quote", lambda *a, **k: None)
 
     client = _fake_client()
     close_order = SimpleNamespace(id="close-roll-1")

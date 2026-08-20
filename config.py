@@ -70,6 +70,7 @@ VIX_SHADOW_BOOK_FILE = VIX_DATA_DIR / "last_known_positions.json"
 VIX_STATE_FILE = VIX_DATA_DIR / "state.json"
 VIX_PAPER_LEDGER_FILE = VIX_DATA_DIR / "paper_ledger.jsonl"
 VIX_ROLL_ALERT_STATE_FILE = VIX_DATA_DIR / "roll_alert_state.json"
+VIX_AUTO_KILL_STATE_FILE = VIX_DATA_DIR / "auto_kill_switch.json"
 
 # ── Google Drive uploads (SRS §10.1 — non-fatal, off by default) ──────────
 ENABLE_GDRIVE_UPLOAD = os.getenv("ENABLE_GDRIVE_UPLOAD", "false").lower() == "true"

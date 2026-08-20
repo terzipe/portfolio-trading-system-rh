@@ -19,6 +19,7 @@ from pathlib import Path
 
 from config import VIX_DATA_DIR, VIX_SPIKE_LEVEL, VIX_STALE_SECONDS, VIX_KILL_SWITCH
 from data.unusual_whales import get_client, UWError
+from monitor import vix_kill_switch
 
 REGIME_TRADER_PATH = Path(__file__).parent.parent.parent / "regime_trader"
 if str(REGIME_TRADER_PATH) not in sys.path:
@@ -125,6 +126,10 @@ def compute_posture(
 
     if VIX_KILL_SWITCH:
         reasons.append("VIX_KILL_SWITCH=true -> flatten-only")
+        return FLATTEN_SVIX, bias_family, reasons
+
+    if vix_kill_switch.is_tripped():
+        reasons.append("auto kill switch tripped (SVIX P&L stop) -> flatten-only")
         return FLATTEN_SVIX, bias_family, reasons
 
     if data_age_sec > VIX_STALE_SECONDS:
