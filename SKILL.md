@@ -408,6 +408,26 @@ already; see root repo git history for the fix).
   returns.
 
 ### VIX Trader — Lessons learned
+- 2026-08-21: Found and fixed a real race condition live, the first time the ladder's real order
+  path was proven end-to-end against actual Alpaca orders rather than synthetic VIX values.
+  record_rung_bought() was called right after execute_actions() reported an order *accepted*
+  (submitted/queued), not *filled* — an after-hours rung buy (187 SVIX shares) sat queued while a
+  scheduled cycle ran in the gap, saw real positions still at zero, and the self-heal logic (built
+  to catch a human manually flattening out of band) misread the merely-pending order as stale state
+  and reset the whole campaign to idle; the order then filled for real minutes later, leaving a
+  genuine holding the ladder's bookkeeping had already forgotten. Fixed by splitting state into
+  "real" (open_lots/rung_levels_bought, only ever written from confirmed fills) and a new
+  pending_orders list written at submission time via record_rung_submitted()/
+  record_takeprofit_submitted(); a new reconcile_pending_orders(client) runs once per real
+  (non-dry-run) cycle before evaluate() and promotes a pending order to real state only once Alpaca
+  confirms filled_qty > 0, or silently drops it on rejected/canceled/expired. Regression-tested
+  directly against the exact live scenario (test_selfheal_does_not_fire_while_a_buy_is_merely_pending).
+  While closing out the test position, also hit a real (correct) BOOK_MISMATCH fail-closed trip on
+  vix_session.py from a race between two manual close orders and a concurrent scheduled cycle —
+  left the 15-minute cooldown alone rather than force-clearing it, and verified fills via a raw
+  TradingClient built straight from config credentials for read-only confirmation only. 131/131
+  tests passing.
+- 2026-08-21: posture=LONG_VOL_TACTICAL, VIX=18.36, session=HEALTHY, actions=1, executed=1, paper_signals=1
 - 2026-08-20: Replaced SVIX_ON/FLATTEN_SVIX (calm-market contango-carry posture) entirely with a
   spike-buying ladder strategy (monitor/vix_ladder.py), per explicit direction after multi-turn
   design review — VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md is the spec. Arms at VIX>30, buys

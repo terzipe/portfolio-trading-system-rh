@@ -4,7 +4,10 @@ VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md for the full spec. No network
 needed — evaluate() is driven entirely by explicit vix/nav/positions/
 live_price args against a persisted (here, tmp_path-isolated) state file.
 """
+from types import SimpleNamespace
+
 import pytest
+from alpaca.trading.enums import OrderStatus
 
 from monitor import vix_ladder
 from monitor.vix_signals import BUY_SVIX_RUNG, SELL_SVIX_PARTIAL
@@ -223,3 +226,124 @@ def test_reset_campaign_clears_everything(isolated_state):
     assert status["armed"] is False
     assert status["rung_levels_bought"] == []
     assert status["current_shares"] == 0
+
+
+# ── Pending-order tracking (fixes the real race hit live 2026-08-21) ───
+
+def _fake_client(status, filled_qty=0, filled_avg_price=None):
+    order = SimpleNamespace(status=status, filled_qty=filled_qty, filled_avg_price=filled_avg_price)
+    client = SimpleNamespace(get_order_by_id=lambda order_id: order)
+    return client
+
+
+def test_record_rung_submitted_does_not_create_a_real_holding(isolated_state):
+    vix_ladder.arm_campaign(31.0)
+    vix_ladder.record_rung_submitted(30, "order-1", 5000)
+
+    status = vix_ladder.get_status()
+    assert status["current_shares"] == 0  # not a real holding yet
+    assert status["rung_levels_bought"] == []
+    assert len(status["pending_orders"]) == 1
+
+
+def test_next_unbought_rung_skips_a_level_with_a_pending_buy(isolated_state):
+    vix_ladder.arm_campaign(31.0)
+    vix_ladder.record_rung_submitted(30, "order-1", 5000)
+
+    # A cycle running before the order-1 fill confirms must not propose a
+    # second buy at rung 30 -- it should skip straight to 40.
+    actions = vix_ladder.evaluate(vix=41.0, nav=1_000_000, positions=[], live_price=41.0)
+    assert len(actions) == 1
+    assert actions[0].position["rung_level"] == 40
+
+
+def test_selfheal_does_not_fire_while_a_buy_is_merely_pending(isolated_state):
+    # The exact race hit live 2026-08-21: order submitted after-hours,
+    # still queued (not filled). A cycle runs in that gap and sees the
+    # real broker position at zero SVIX. Before the fix, this triggered
+    # self-heal and wiped the campaign; now it must not, since the
+    # pending order was never recorded as a real holding in the first
+    # place.
+    vix_ladder.arm_campaign(31.0)
+    vix_ladder.record_rung_submitted(30, "order-1", 5000)
+
+    actions = vix_ladder.evaluate(vix=31.5, nav=1_000_000, positions=[], live_price=31.5)
+
+    status = vix_ladder.get_status()
+    assert status["armed"] is True  # NOT reset
+    assert len(status["pending_orders"]) == 1  # still tracked, awaiting fill
+
+
+def test_reconcile_finalizes_a_filled_buy_into_a_real_holding(isolated_state):
+    vix_ladder.arm_campaign(31.0)
+    vix_ladder.record_rung_submitted(30, "order-1", 5000)
+
+    client = _fake_client(OrderStatus.FILLED, filled_qty=166, filled_avg_price="30.12")
+    vix_ladder.reconcile_pending_orders(client)
+
+    status = vix_ladder.get_status()
+    assert status["current_shares"] == 166
+    assert status["rung_levels_bought"] == [30]
+    assert status["pending_orders"] == []
+
+
+def test_reconcile_leaves_a_still_unfilled_order_pending(isolated_state):
+    vix_ladder.arm_campaign(31.0)
+    vix_ladder.record_rung_submitted(30, "order-1", 5000)
+
+    client = _fake_client(OrderStatus.ACCEPTED)
+    vix_ladder.reconcile_pending_orders(client)
+
+    status = vix_ladder.get_status()
+    assert status["current_shares"] == 0
+    assert len(status["pending_orders"]) == 1
+
+
+def test_reconcile_drops_a_rejected_order_without_creating_a_holding(isolated_state):
+    vix_ladder.arm_campaign(31.0)
+    vix_ladder.record_rung_submitted(30, "order-1", 5000)
+
+    client = _fake_client(OrderStatus.REJECTED)
+    vix_ladder.reconcile_pending_orders(client)
+
+    status = vix_ladder.get_status()
+    assert status["current_shares"] == 0
+    assert status["rung_levels_bought"] == []
+    assert status["pending_orders"] == []
+    # The rung is available again for a future attempt.
+    actions = vix_ladder.evaluate(vix=31.0, nav=1_000_000, positions=[], live_price=31.0)
+    assert actions[0].position["rung_level"] == 30
+
+
+def test_reconcile_finalizes_a_filled_takeprofit_sell(isolated_state):
+    vix_ladder.arm_campaign(40.0)
+    vix_ladder.record_rung_bought(30, 100, 30.0)
+    vix_ladder.record_takeprofit_submitted(1, "sell-order-1", 25)
+
+    client = _fake_client(OrderStatus.FILLED, filled_qty=25)
+    vix_ladder.reconcile_pending_orders(client)
+
+    status = vix_ladder.get_status()
+    assert status["current_shares"] == 75
+    assert status["take_profit_steps_done"] == 1
+    assert status["pending_orders"] == []
+
+
+def test_reconcile_survives_a_client_lookup_error(isolated_state):
+    vix_ladder.arm_campaign(31.0)
+    vix_ladder.record_rung_submitted(30, "order-1", 5000)
+
+    class _FailingClient:
+        def get_order_by_id(self, order_id):
+            raise Exception("boom")
+
+    vix_ladder.reconcile_pending_orders(_FailingClient())  # must not raise
+
+    status = vix_ladder.get_status()
+    assert len(status["pending_orders"]) == 1  # unchanged, retry next cycle
+
+
+def test_reconcile_noop_when_nothing_pending(isolated_state):
+    vix_ladder.arm_campaign(31.0)
+    vix_ladder.reconcile_pending_orders(_fake_client(OrderStatus.FILLED, filled_qty=1))  # should not touch state
+    assert vix_ladder.get_status()["pending_orders"] == []

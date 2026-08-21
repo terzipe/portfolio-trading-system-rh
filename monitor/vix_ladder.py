@@ -18,16 +18,27 @@ State-mutation split, deliberately:
     observed, and self-healing back to idle if real fetched positions show
     zero SVIX held while the campaign thinks it's still open (e.g. after a
     manual "Flatten SVIX now" click, or a trade placed directly in Alpaca).
-  - It NEVER persists trade-related state (a new rung bought, a take-profit
-    step taken) — those are only recorded via record_rung_bought()/
-    record_take_profit_step(), called by the loop scripts after
-    execute_actions() confirms the order actually executed. Same principle
-    VIX_STATE_FILE/paper-ledger writes already follow elsewhere: never
-    record something that might not have really happened.
+  - Trade-related state (a rung actually bought, a take-profit step actually
+    taken) is only finalized into open_lots/rung_levels_bought once a real
+    fill is confirmed via reconcile_pending_orders() — never on order
+    *submission*. This closes a real bug hit live 2026-08-21: recording a
+    rung as bought right after submission (order accepted, not yet filled)
+    left a window — order submitted after-hours, sitting queued — where a
+    scheduled cycle ran, saw the real broker position still at zero SVIX
+    (not filled yet) while state said shares existed, and the self-heal
+    logic (below) misread that as a stale record and reset the whole
+    campaign, silently forgetting about a real position that filled minutes
+    later. record_rung_submitted()/record_takeprofit_submitted() track an
+    order as *pending* (in state["pending_orders"], separate from
+    open_lots/rung_levels_bought, so self-heal and _next_unbought_rung()
+    both correctly ignore it until it's real) — reconcile_pending_orders()
+    is what promotes a pending order to a real holding once Alpaca actually
+    reports it filled, or drops it if rejected/canceled/expired.
 
-Known limitation: reconciliation only handles the "real shares are zero but
-state thinks otherwise" case. A partial out-of-band sell (some, not all,
-shares sold manually) is not detected/reconciled — out of scope for now.
+Known limitation: self-heal reconciliation only handles the "real shares
+are zero but state thinks otherwise" case. A partial out-of-band sell
+(some, not all, shares sold manually) is not detected/reconciled — out of
+scope for now.
 """
 from __future__ import annotations
 
@@ -55,6 +66,7 @@ def _default_state() -> dict:
         "rung_levels_bought": [],
         "open_lots": [],  # FIFO: [{"level","qty_remaining","price","at"}]
         "take_profit_steps_done": 0,
+        "pending_orders": [],  # [{"kind":"buy"|"sell","order_id",...}] -- submitted, not yet confirmed filled
     }
 
 
@@ -95,8 +107,12 @@ def _held_svix_shares(positions: list[dict]) -> dict | None:
 
 
 def _next_unbought_rung(state: dict, vix: float) -> float | None:
+    # Excludes rungs with a pending (submitted-but-unconfirmed) buy too --
+    # otherwise a second cycle running before the first order's fill
+    # confirms would submit a duplicate buy at the same level.
     level = VIX_LADDER_ARM_LEVEL
     bought = set(state["rung_levels_bought"])
+    bought |= {p["level"] for p in state["pending_orders"] if p["kind"] == "buy"}
     while level <= vix:
         if level not in bought:
             return level
@@ -112,6 +128,11 @@ def arm_campaign(vix: float) -> None:
 
 
 def record_rung_bought(level: float, qty: float, price: float) -> None:
+    """Finalizes a CONFIRMED fill into real state. Not called directly by
+    the loop scripts anymore — only from reconcile_pending_orders() once a
+    pending buy is actually confirmed filled by Alpaca. Kept as its own
+    function (rather than inlined) since it's independently unit-tested and
+    is also the natural "finalize" step reconcile_pending_orders() calls."""
     state = _load_state()
     state["rung_levels_bought"].append(level)
     state["open_lots"].append({
@@ -124,8 +145,11 @@ def record_rung_bought(level: float, qty: float, price: float) -> None:
 
 
 def record_take_profit_step(step_n: int, sell_qty: float) -> None:
-    """Consumes sell_qty from open_lots FIFO (earliest/cheapest rungs
-    first, matching the codebase's existing FIFO convention — see
+    """Finalizes a CONFIRMED take-profit fill. Same note as
+    record_rung_bought() above — called from reconcile_pending_orders()
+    once confirmed, not directly by the loop scripts. Consumes sell_qty
+    from open_lots FIFO (earliest/cheapest rungs first, matching the
+    codebase's existing FIFO convention — see
     vix_ledger.fifo_realized_pnl()). campaign_peak_shares is a permanent
     high-water mark and is not decremented here."""
     state = _load_state()
@@ -145,6 +169,71 @@ def record_take_profit_step(step_n: int, sell_qty: float) -> None:
     _save_state(state)
 
 
+def record_rung_submitted(level: float, order_id: str, target_dollars: float) -> None:
+    """Called by the loop scripts right after execute_actions() confirms a
+    BUY_SVIX_RUNG order was *accepted* by Alpaca — not yet a real fill.
+    Tracked in pending_orders, separate from open_lots/rung_levels_bought,
+    so it can't be mistaken for a real holding (by self-heal) or leave a
+    rung level open to a duplicate buy (by _next_unbought_rung()) while the
+    fill is still in flight."""
+    state = _load_state()
+    state["pending_orders"].append({
+        "kind": "buy", "level": level, "order_id": order_id, "target_dollars": target_dollars,
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+    })
+    _save_state(state)
+
+
+def record_takeprofit_submitted(step_n: int, order_id: str, sell_quantity: float) -> None:
+    """Same as record_rung_submitted(), for the SELL_SVIX_PARTIAL side."""
+    state = _load_state()
+    state["pending_orders"].append({
+        "kind": "sell", "step": step_n, "order_id": order_id, "sell_quantity": sell_quantity,
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+    })
+    _save_state(state)
+
+
+def reconcile_pending_orders(client) -> None:
+    """Call once per real (non-dry-run) cycle, before evaluate(). Checks
+    every pending order's real status and finalizes it (via
+    record_rung_bought()/record_take_profit_step()) once Alpaca actually
+    reports a fill, or drops it if rejected/canceled/expired. This is what
+    makes a real fill visible to the campaign at all — closes the race
+    condition described in the module docstring, hit live 2026-08-21."""
+    state = _load_state()
+    if not state["pending_orders"]:
+        return
+
+    still_pending = []
+    for pending in state["pending_orders"]:
+        try:
+            order = client.get_order_by_id(pending["order_id"])
+        except Exception:  # noqa: BLE001
+            still_pending.append(pending)
+            continue
+
+        status = getattr(order, "status", None)
+        status_value = getattr(status, "value", None)
+        filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+
+        if status_value == "filled" and filled_qty > 0:
+            filled_price = getattr(order, "filled_avg_price", None)
+            if pending["kind"] == "buy":
+                price = float(filled_price) if filled_price else pending["target_dollars"] / filled_qty
+                record_rung_bought(pending["level"], filled_qty, price)
+            else:
+                record_take_profit_step(pending["step"], filled_qty)
+        elif status_value in ("rejected", "canceled", "expired"):
+            pass  # dropped -- never finalized, nothing to undo
+        else:
+            still_pending.append(pending)
+
+    state = _load_state()  # re-load: record_*() above may have just written
+    state["pending_orders"] = still_pending
+    _save_state(state)
+
+
 def reset_campaign() -> None:
     _save_state(_default_state())
 
@@ -159,6 +248,7 @@ def get_status() -> dict:
         "current_shares": _current_shares(state),
         "current_cost_basis": _current_cost_basis(state),
         "take_profit_steps_done": state["take_profit_steps_done"],
+        "pending_orders": state["pending_orders"],
     }
 
 
