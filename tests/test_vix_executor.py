@@ -17,11 +17,11 @@ from unittest.mock import MagicMock
 from alpaca.trading.enums import OrderStatus
 
 from monitor import vix_executor
-from monitor.vix_executor import _size_svix_shares, _size_option_contracts, _size_and_explain_option, _occ_symbol
+from monitor.vix_executor import _size_option_contracts, _size_and_explain_option, _occ_symbol
 from monitor.vix_options import ContractPick
 from monitor.vix_session import SessionResult, HEALTHY, DEAD
 from monitor.vix_signals import (
-    Action, SELL_SVIX_ALL, BUY_SVIX_SHARES, BUY_UVXY_PUT, BUY_VXX_CALL, CLOSE_OPTION, ROLL_OPTION,
+    Action, SELL_SVIX_ALL, BUY_SVIX_RUNG, SELL_SVIX_PARTIAL, BUY_UVXY_PUT, BUY_VXX_CALL, CLOSE_OPTION, ROLL_OPTION,
 )
 
 
@@ -95,43 +95,20 @@ def test_live_run_still_writes_state_file_and_calls_alpaca(monkeypatch, tmp_path
     assert json.loads(state_file.read_text())["last_flatten_reason"] == "test flatten"
 
 
-# ── Position sizing (BUY_SVIX_SHARES) ───────────────────────────────────
+# ── SVIX ladder rung entries (BUY_SVIX_RUNG) — dollar-target sizing,
+# no re-entry lock (see monitor/vix_ladder.py + VIX_SVIX_LADDER_STRATEGY_
+# REQUIREMENTS.md). Sizing itself (target_dollars -> whole shares at the
+# live quote) now lives in _execute_ladder_rung(), not a standalone
+# _size_*() helper — the dollar target is computed by vix_ladder.py, not
+# here. ──────────────────────────────────────────────────────────────────
 
-def test_size_svix_shares_bound_by_svix_cap_when_sleeve_is_clear():
-    # NAV=$10,000, SVIX cap 5% = $500, price=$26 -> floor(500/26) = 19
-    qty, mv = _size_svix_shares(nav=10000, sleeve_mv=0, price=26.0)
-    assert qty == 19
-    assert mv == 19 * 26.0
-
-
-def test_size_svix_shares_bound_by_tighter_sleeve_headroom():
-    # sleeve already holds $300 of other vol positions (VXX/UVXY options).
-    # Sleeve cap 5%*10000=$500 -> headroom $200, tighter than the $500 SVIX
-    # cap alone -> floor(200/26) = 7, not 19.
-    qty, mv = _size_svix_shares(nav=10000, sleeve_mv=300, price=26.0)
-    assert qty == 7
-
-
-def test_size_svix_shares_zero_when_headroom_below_one_share():
-    qty, mv = _size_svix_shares(nav=10000, sleeve_mv=480, price=26.0)  # $20 headroom
-    assert qty == 0
-    assert mv == 0.0
-
-
-def test_size_svix_shares_zero_on_real_small_nav():
-    # Real small-account case: NAV=$193.67, SVIX~$26.10 -> 5% cap = $9.68,
-    # can't afford one share. Must refuse, not round up.
-    qty, mv = _size_svix_shares(nav=193.67, sleeve_mv=0, price=26.10)
-    assert qty == 0
-
-
-def test_dry_run_entry_previews_correctly_sized_order(monkeypatch, tmp_path):
+def test_dry_run_ladder_rung_previews_dollar_sized_order(monkeypatch, tmp_path):
     monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_BUY", True)
 
     client = _fake_client()
     session = _healthy_session(client)
-    action = Action(BUY_SVIX_SHARES, "SVIX", "test entry")
+    action = Action(BUY_SVIX_RUNG, "SVIX", "ladder rung 30", {"target_dollars": 5000, "rung_level": 30})
 
     outcomes = vix_executor.execute_actions([action], session, nav=10000, sleeve_mv=0, quote_fn=lambda t: 26.0, dry_run=True)
 
@@ -140,44 +117,96 @@ def test_dry_run_entry_previews_correctly_sized_order(monkeypatch, tmp_path):
     assert o.would_execute is True
     assert o.order_preview == {
         "call": "submit_order", "order_type": "market", "symbol": "SVIX",
-        "quantity": 19, "side": "buy", "time_in_force": "day",
+        "quantity": 192, "side": "buy", "time_in_force": "day",  # floor(5000/26.0)
     }
     client.submit_order.assert_not_called()
 
 
-def test_zero_quantity_entry_is_refused_cleanly_not_submitted(monkeypatch, tmp_path):
+def test_ladder_rung_zero_quantity_is_refused_cleanly(monkeypatch, tmp_path):
     monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_BUY", True)
 
     client = _fake_client()
     session = _healthy_session(client)
-    action = Action(BUY_SVIX_SHARES, "SVIX", "test entry")
+    action = Action(BUY_SVIX_RUNG, "SVIX", "ladder rung 30", {"target_dollars": 10, "rung_level": 30})
 
-    outcomes = vix_executor.execute_actions([action], session, nav=193.67, sleeve_mv=0, quote_fn=lambda t: 26.10, dry_run=True)
+    outcomes = vix_executor.execute_actions([action], session, nav=10000, sleeve_mv=0, quote_fn=lambda t: 26.0, dry_run=True)
 
     o = outcomes[0]
-    assert o.executed is False
     assert o.would_execute is False
     assert "sized to 0 shares" in o.skip_reason
     client.submit_order.assert_not_called()
 
 
-def test_live_entry_calls_submit_order_with_computed_quantity(monkeypatch, tmp_path):
+def test_live_ladder_rung_calls_submit_order_with_computed_quantity(monkeypatch, tmp_path):
     state_file = tmp_path / "state.json"
     monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", state_file)
     monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_BUY", True)
 
-    client = _fake_client(order_id="buy123")
+    client = _fake_client(order_id="rung123")
     session = _healthy_session(client)
-    action = Action(BUY_SVIX_SHARES, "SVIX", "test entry")
+    action = Action(BUY_SVIX_RUNG, "SVIX", "ladder rung 30", {"target_dollars": 5000, "rung_level": 30})
 
     outcomes = vix_executor.execute_actions([action], session, nav=10000, sleeve_mv=0, quote_fn=lambda t: 26.0, dry_run=False)
 
     assert outcomes[0].executed is True
     req = _last_request(client)
-    assert req.symbol == "SVIX" and float(req.qty) == 19 and req.side.value == "buy" and req.time_in_force.value == "day"
-    assert state_file.exists()
-    assert json.loads(state_file.read_text())["last_entry_session"] == vix_executor._session_id()
+    assert req.symbol == "SVIX" and float(req.qty) == 192 and req.side.value == "buy" and req.time_in_force.value == "day"
+
+
+def test_ladder_rung_bypasses_reentry_lock_multiple_same_day_buys(monkeypatch, tmp_path):
+    # The generic per-day entry lock is built for the old one-shot SVIX_ON
+    # model — the ladder needs to buy multiple rungs in a single day if VIX
+    # rips through 30->40->50, so BUY_SVIX_RUNG must not be blocked by it.
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", state_file)
+    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_BUY", True)
+
+    first_client = _fake_client(order_id="rung1")
+    first_session = _healthy_session(first_client)
+    first = Action(BUY_SVIX_RUNG, "SVIX", "ladder rung 30", {"target_dollars": 1000, "rung_level": 30})
+    outcomes1 = vix_executor.execute_actions([first], first_session, nav=10000, sleeve_mv=0, quote_fn=lambda t: 26.0, dry_run=False)
+    assert outcomes1[0].executed is True
+
+    # A second rung buy later the same day must still go through.
+    second_client = _fake_client(order_id="rung2")
+    second_session = _healthy_session(second_client)
+    second = Action(BUY_SVIX_RUNG, "SVIX", "ladder rung 40", {"target_dollars": 1000, "rung_level": 40})
+    outcomes2 = vix_executor.execute_actions([second], second_session, nav=10000, sleeve_mv=0, quote_fn=lambda t: 36.0, dry_run=False)
+    assert outcomes2[0].executed is True
+    assert "re-entry locked" not in outcomes2[0].skip_reason
+    assert "1 new entry per session" not in outcomes2[0].skip_reason
+
+
+# ── SVIX ladder take-profit (SELL_SVIX_PARTIAL) ─────────────────────────
+
+def test_ladder_take_profit_sells_exact_quantity(monkeypatch, tmp_path):
+    monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_SELL", True)
+
+    client = _fake_client(order_id="tp1")
+    session = _healthy_session(client)
+    action = Action(SELL_SVIX_PARTIAL, "SVIX", "take-profit step 1/4", {"sell_quantity": 41, "step": 1})
+
+    outcomes = vix_executor.execute_actions([action], session, nav=10000, sleeve_mv=0, quote_fn=lambda t: 30.0, dry_run=False)
+
+    assert outcomes[0].executed is True
+    req = _last_request(client)
+    assert req.symbol == "SVIX" and float(req.qty) == 41 and req.side.value == "sell"
+
+
+def test_ladder_take_profit_exempt_from_kill_switch(monkeypatch, tmp_path):
+    monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(vix_executor, "VIX_KILL_SWITCH", True)
+    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_SELL", True)
+
+    client = _fake_client()
+    session = _healthy_session(client)
+    action = Action(SELL_SVIX_PARTIAL, "SVIX", "take-profit step 1/4", {"sell_quantity": 41, "step": 1})
+
+    outcomes = vix_executor.execute_actions([action], session, nav=10000, sleeve_mv=0, quote_fn=lambda t: 30.0, dry_run=True)
+
+    assert outcomes[0].would_execute is True  # kill switch never blocks a flatten-style sell
 
 
 # ── OCC option symbol builder ───────────────────────────────────────────
@@ -431,32 +460,12 @@ def test_kill_switch_blocks_entries_when_healthy(monkeypatch, tmp_path):
 
     client = _fake_client()
     session = _healthy_session(client)
-    action = Action(BUY_SVIX_SHARES, "SVIX", "kill switch drill: entry")
+    action = Action(BUY_SVIX_RUNG, "SVIX", "kill switch drill: entry", {"target_dollars": 1000, "rung_level": 30})
 
     outcomes = vix_executor.execute_actions([action], session, nav=10000, sleeve_mv=0, quote_fn=lambda t: 26.0, dry_run=True)
 
     assert outcomes[0].would_execute is False
     assert "VIX_KILL_SWITCH=true" in outcomes[0].skip_reason
-    client.submit_order.assert_not_called()
-
-
-def test_auto_kill_switch_blocks_entries_but_not_flattens(monkeypatch, tmp_path):
-    monkeypatch.setattr(vix_executor, "VIX_STATE_FILE", tmp_path / "state.json")
-    monkeypatch.setattr(vix_executor, "VIX_KILL_SWITCH", False)
-    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_BUY", True)
-    monkeypatch.setattr(vix_executor, "ENABLE_VIX_AUTO_SELL", True)
-    monkeypatch.setattr(vix_executor.vix_kill_switch, "is_tripped", lambda: True)
-
-    client = _fake_client()
-    session = _healthy_session(client)
-    entry = Action(BUY_SVIX_SHARES, "SVIX", "auto kill switch drill: entry")
-    flatten = Action(SELL_SVIX_ALL, "SVIX", "auto kill switch drill: flatten", {"type": "share", "quantity": 10})
-
-    outcomes = vix_executor.execute_actions([entry, flatten], session, nav=10000, sleeve_mv=250, quote_fn=lambda t: 26.0, dry_run=True)
-
-    assert outcomes[0].would_execute is False
-    assert "auto kill switch tripped" in outcomes[0].skip_reason
-    assert outcomes[1].would_execute is True  # flatten still allowed
     client.submit_order.assert_not_called()
 
 
@@ -467,7 +476,7 @@ def test_kill_switch_plus_dead_session_is_alert_only_zero_orders(monkeypatch, tm
 
     dead_session = SessionResult(state=DEAD, reason="session build failed", client=None)
     flatten = Action(SELL_SVIX_ALL, "SVIX", "kill switch + dead", {"type": "share", "quantity": 10})
-    entry = Action(BUY_SVIX_SHARES, "SVIX", "kill switch + dead")
+    entry = Action(BUY_SVIX_RUNG, "SVIX", "kill switch + dead", {"target_dollars": 1000, "rung_level": 30})
 
     outcomes = vix_executor.execute_actions([flatten, entry], dead_session, nav=10000, sleeve_mv=0, quote_fn=lambda t: 26.0, dry_run=True)
 
@@ -478,7 +487,7 @@ def test_kill_switch_plus_dead_session_is_alert_only_zero_orders(monkeypatch, tm
 def test_dead_session_produces_zero_orders_for_any_proposed_action():
     dead_session = SessionResult(state=DEAD, reason="account/equity check failed", client=None)
     flatten = Action(SELL_SVIX_ALL, "SVIX", "dead session drill: flatten", {"type": "share", "quantity": 10})
-    entry = Action(BUY_SVIX_SHARES, "SVIX", "dead session drill: entry")
+    entry = Action(BUY_SVIX_RUNG, "SVIX", "dead session drill: entry", {"target_dollars": 1000, "rung_level": 30})
 
     outcomes = vix_executor.execute_actions([flatten, entry], dead_session, nav=10000, sleeve_mv=0, quote_fn=lambda t: 26.0, dry_run=True)
 

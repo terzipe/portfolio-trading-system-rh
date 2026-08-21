@@ -24,14 +24,14 @@ from alpaca.trading.enums import OrderSide, OrderStatus, TimeInForce
 from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
 
 from config import (
-    VIX_STATE_FILE, VIX_SLEEVE_MAX_PCT, VIX_SVIX_MAX_PCT,
+    VIX_STATE_FILE, VIX_SLEEVE_MAX_PCT,
     VIX_MAX_CONTRACTS, VIX_KILL_SWITCH, ENABLE_VIX_AUTO_SELL, ENABLE_VIX_AUTO_BUY,
     ENABLE_VIX_AUTO_ROLL,
 )
-from monitor import vix_kill_switch, vix_options
+from monitor import vix_options
 from monitor.vix_session import SessionResult, HEALTHY, can_flatten, can_buy
 from monitor.vix_signals import (
-    Action, SELL_SVIX_ALL, BUY_SVIX_SHARES, BUY_UVXY_PUT, BUY_VXX_PUT,
+    Action, SELL_SVIX_ALL, BUY_SVIX_RUNG, SELL_SVIX_PARTIAL, BUY_UVXY_PUT, BUY_VXX_PUT,
     BUY_VXX_CALL, BUY_UVXY_CALL, ROLL_OPTION, CLOSE_OPTION, HOLD, NOOP,
 )
 
@@ -116,38 +116,22 @@ def _poll_order_confirmed(client, order_id: str, timeout: float = 20.0) -> bool:
     return False
 
 
-def _sleeve_pct_ok(current_mv: float, proposed_mv: float, nav: float, svix_only: bool = False) -> bool:
+def _sleeve_pct_ok(current_mv: float, proposed_mv: float, nav: float) -> bool:
+    """Options-only now — SVIX no longer sizes against VIX_SLEEVE_MAX_PCT at
+    all; the ladder (monitor/vix_ladder.py) has its own independent
+    15%-of-NAV budget, enforced before a BUY_SVIX_RUNG action is even
+    proposed."""
     if nav <= 0:
         return False
-    cap = VIX_SVIX_MAX_PCT if svix_only else VIX_SLEEVE_MAX_PCT
-    return (current_mv + proposed_mv) / nav <= cap
-
-
-def _size_svix_shares(nav: float, sleeve_mv: float, price: float) -> tuple[int, float]:
-    """
-    Target dollar allocation is the tighter of VIX_SVIX_MAX_PCT (SVIX alone)
-    and whatever headroom remains under VIX_SLEEVE_MAX_PCT (all vol
-    products combined, including any held VXX/UVXY options). Only called
-    when entering fresh — vix_signals.decide_actions() only proposes
-    BUY_SVIX_SHARES when no SVIX is currently held (SRS §7.7/§8.5) — so the
-    SVIX cap alone, not current_svix_mv + proposed, bounds it directly.
-    Rounds down; a target that can't afford even one share returns (0, 0.0)
-    rather than rounding up past either cap.
-    """
-    if nav <= 0 or price <= 0:
-        return 0, 0.0
-    svix_cap_mv = VIX_SVIX_MAX_PCT * nav
-    sleeve_headroom_mv = max(0.0, VIX_SLEEVE_MAX_PCT * nav - sleeve_mv)
-    target_mv = min(svix_cap_mv, sleeve_headroom_mv)
-    quantity = int(target_mv // price)
-    return quantity, quantity * price
+    return (current_mv + proposed_mv) / nav <= VIX_SLEEVE_MAX_PCT
 
 
 def _size_option_contracts(nav: float, sleeve_mv: float, premium_per_contract: float) -> int:
     """
-    UVXY/VXX puts and calls are not SVIX, so only the general sleeve cap
-    applies (VIX_SVIX_MAX_PCT is SVIX-specific) — bounded further by
-    VIX_MAX_CONTRACTS regardless of how much dollar headroom remains.
+    UVXY/VXX puts and calls size against the general sleeve cap (SVIX no
+    longer has a sleeve-pct-based cap at all — see monitor/vix_ladder.py's
+    own independent budget) — bounded further by VIX_MAX_CONTRACTS
+    regardless of how much dollar headroom remains.
     premium_per_contract is dollars per contract (RH Tracker convention:
     quoted mid * 100), matching vix_positions.py's cost_basis convention.
     Rounds down; refuses (0) rather than exceeding either cap.
@@ -226,14 +210,13 @@ def execute_actions(
             outcomes.append(ExecutionOutcome(action, False, skip_reason="no-op"))
             continue
 
-        is_flatten = action.action in (SELL_SVIX_ALL, CLOSE_OPTION)
-        is_entry = action.action in (BUY_SVIX_SHARES, BUY_UVXY_PUT, BUY_VXX_PUT, BUY_VXX_CALL, BUY_UVXY_CALL)
+        is_flatten = action.action in (SELL_SVIX_ALL, CLOSE_OPTION, SELL_SVIX_PARTIAL)
+        is_entry = action.action in (BUY_UVXY_PUT, BUY_VXX_PUT, BUY_VXX_CALL, BUY_UVXY_CALL)
+        is_ladder_buy = action.action == BUY_SVIX_RUNG
         is_roll = action.action == ROLL_OPTION
 
-        auto_tripped = vix_kill_switch.is_tripped()
-        if (VIX_KILL_SWITCH or auto_tripped) and not is_flatten:
-            reason = "VIX_KILL_SWITCH=true" if VIX_KILL_SWITCH else "auto kill switch tripped (SVIX P&L stop)"
-            outcomes.append(ExecutionOutcome(action, False, skip_reason=f"{reason} — flatten-only"))
+        if VIX_KILL_SWITCH and not is_flatten:
+            outcomes.append(ExecutionOutcome(action, False, skip_reason="VIX_KILL_SWITCH=true — flatten-only"))
             continue
 
         if is_flatten:
@@ -277,23 +260,7 @@ def execute_actions(
             quantity = None
             contract = None
 
-            if action.action == BUY_SVIX_SHARES:
-                if price is None or price <= 0:
-                    outcomes.append(ExecutionOutcome(action, False, skip_reason="no price to size SVIX buy"))
-                    continue
-                quantity, proposed_mv = _size_svix_shares(nav, sleeve_mv, price)
-                if quantity <= 0:
-                    outcomes.append(ExecutionOutcome(
-                        action, False,
-                        skip_reason=(
-                            f"sized to 0 shares — target allocation ${proposed_mv:.2f} at ${price:.2f}/share "
-                            f"rounds down to 0 (NAV=${nav:.2f}, sleeve_mv=${sleeve_mv:.2f}, "
-                            f"caps: SVIX {VIX_SVIX_MAX_PCT:.0%}, sleeve {VIX_SLEEVE_MAX_PCT:.0%})"
-                        ),
-                    ))
-                    continue
-
-            elif action.action in (BUY_UVXY_PUT, BUY_VXX_PUT):
+            if action.action in (BUY_UVXY_PUT, BUY_VXX_PUT):
                 if price is None or price <= 0:
                     outcomes.append(ExecutionOutcome(action, False, skip_reason=f"no spot price for {action.ticker} to pick a put"))
                     continue
@@ -316,11 +283,7 @@ def execute_actions(
                     outcomes.append(ExecutionOutcome(action, False, skip_reason=size_reason))
                     continue
 
-            else:
-                proposed_mv = 0.0
-
-            svix_only = action.action == BUY_SVIX_SHARES
-            if not _sleeve_pct_ok(sleeve_mv, proposed_mv, nav, svix_only=svix_only):
+            if not _sleeve_pct_ok(sleeve_mv, proposed_mv, nav):
                 outcomes.append(ExecutionOutcome(action, False, skip_reason="sleeve % cap would be exceeded"))
                 continue
 
@@ -331,6 +294,32 @@ def execute_actions(
                 state["last_entry_session"] = _session_id()
                 if not dry_run:
                     _save_state(state)
+                if outcome.executed:
+                    confirmed = _poll_order_confirmed(client, outcome.order_id)
+                    if not confirmed:
+                        outcomes[-1].skip_reason = "order unconfirmed — stopping cycle, no second market order"
+                        break
+            continue
+
+        if is_ladder_buy:
+            if not ENABLE_VIX_AUTO_BUY:
+                outcomes.append(ExecutionOutcome(action, False, skip_reason="ENABLE_VIX_AUTO_BUY=false"))
+                continue
+            if not can_buy(session):
+                outcomes.append(ExecutionOutcome(action, False, skip_reason=f"session {session.state} != HEALTHY, no buys"))
+                continue
+            # Deliberately no _entry_locked()/last_flatten_session check here
+            # — those exist to cap the old one-shot-per-day SVIX_ON model.
+            # The ladder can legitimately buy several rungs in one day if
+            # VIX rips through 30->40->50, and its own rung history (in
+            # monitor/vix_ladder.py's persisted state) is what prevents a
+            # duplicate buy at the same rung, so the generic per-day lock
+            # would be actively wrong here, not just redundant.
+            price = quote_fn(action.ticker) if action.ticker else None
+            outcome = _execute_ladder_rung(client, action, price, dry_run=dry_run)
+            outcomes.append(outcome)
+            if outcome.executed or outcome.would_execute:
+                orders_this_cycle += 1
                 if outcome.executed:
                     confirmed = _poll_order_confirmed(client, outcome.order_id)
                     if not confirmed:
@@ -423,7 +412,60 @@ def _execute_flatten(client, action: Action, dry_run: bool = False) -> Execution
             order = _submit_limit_order(client, occ, qty, OrderSide.SELL, limit_price)
             return ExecutionOutcome(action, True, would_execute=True, order_preview=preview, order_id=str(order.id))
 
+        if action.action == SELL_SVIX_PARTIAL and action.position:
+            # A ladder take-profit step — sells a specific quantity (a
+            # fraction of the campaign's peak share count), not the full
+            # held position, so this deliberately does NOT read
+            # action.position["quantity"] the way SELL_SVIX_ALL does above.
+            qty = action.position.get("sell_quantity", 0)
+            if qty <= 0:
+                return ExecutionOutcome(action, False, skip_reason="no ladder take-profit quantity to sell")
+            preview = {
+                "call": "submit_order", "order_type": "market", "symbol": action.ticker,
+                "quantity": qty, "side": "sell", "time_in_force": "day",
+            }
+            if dry_run:
+                return ExecutionOutcome(
+                    action, False, would_execute=True, order_preview=preview, dry_run=True,
+                    skip_reason="DRY RUN — order not submitted",
+                )
+            order = _submit_market_order(client, action.ticker, qty, OrderSide.SELL)
+            return ExecutionOutcome(action, True, would_execute=True, order_preview=preview, order_id=str(order.id))
+
         return ExecutionOutcome(action, False, skip_reason="no matching flatten handler")
+    except Exception as exc:  # noqa: BLE001
+        return ExecutionOutcome(action, False, skip_reason=f"order failed: {exc}")
+
+
+def _execute_ladder_rung(client, action: Action, price: float | None, dry_run: bool = False) -> ExecutionOutcome:
+    """BUY_SVIX_RUNG — converts the ladder's target_dollars to whole shares
+    at the live quote (sizing happens here, not in vix_ladder.py, since
+    vix_ladder.evaluate() only proposes a dollar amount — the same
+    dollars-to-shares-at-submission-time split _execute_ladder_rung() vs.
+    monitor/vix_ladder.py mirrors how option entries already split contract
+    *selection* (vix_options.py) from order *sizing/submission*
+    (vix_executor.py)."""
+    try:
+        if price is None or price <= 0:
+            return ExecutionOutcome(action, False, skip_reason="no price to size SVIX ladder rung buy")
+        target_dollars = action.position.get("target_dollars", 0) if action.position else 0
+        quantity = int(target_dollars // price)
+        if quantity <= 0:
+            return ExecutionOutcome(
+                action, False,
+                skip_reason=f"sized to 0 shares — target ${target_dollars:.2f} at ${price:.2f}/share rounds down to 0",
+            )
+        preview = {
+            "call": "submit_order", "order_type": "market", "symbol": action.ticker,
+            "quantity": quantity, "side": "buy", "time_in_force": "day",
+        }
+        if dry_run:
+            return ExecutionOutcome(
+                action, False, would_execute=True, order_preview=preview, dry_run=True,
+                skip_reason="DRY RUN — order not submitted",
+            )
+        order = _submit_market_order(client, action.ticker, quantity, OrderSide.BUY)
+        return ExecutionOutcome(action, True, would_execute=True, order_preview=preview, order_id=str(order.id))
     except Exception as exc:  # noqa: BLE001
         return ExecutionOutcome(action, False, skip_reason=f"order failed: {exc}")
 
@@ -433,27 +475,6 @@ def _execute_entry(
     quantity: int | None = None, contract=None, dry_run: bool = False,
 ) -> ExecutionOutcome:
     try:
-        if action.action == BUY_SVIX_SHARES:
-            if price is None or price <= 0:
-                return ExecutionOutcome(action, False, skip_reason="no price to size SVIX buy")
-            if not quantity or quantity <= 0:
-                # Caller (execute_actions) is expected to have already
-                # refused a 0-quantity size with a detailed reason before
-                # reaching here — this is a defensive fallback, not the
-                # primary path.
-                return ExecutionOutcome(action, False, skip_reason="sized to 0 shares — refusing to submit")
-            preview = {
-                "call": "submit_order", "order_type": "market", "symbol": action.ticker,
-                "quantity": quantity, "side": "buy", "time_in_force": "day",
-            }
-            if dry_run:
-                return ExecutionOutcome(
-                    action, False, would_execute=True, order_preview=preview, dry_run=True,
-                    skip_reason="DRY RUN — order not submitted",
-                )
-            order = _submit_market_order(client, action.ticker, quantity, OrderSide.BUY)
-            return ExecutionOutcome(action, True, would_execute=True, order_preview=preview, order_id=str(order.id))
-
         if action.action in (BUY_UVXY_PUT, BUY_VXX_PUT, BUY_VXX_CALL, BUY_UVXY_CALL):
             if contract is None or not quantity or quantity <= 0:
                 # Caller is expected to have already refused with a detailed

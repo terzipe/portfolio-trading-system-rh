@@ -9,10 +9,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from data.unusual_whales import UWError
-from monitor.vix_regime import SVIX_ON, LONG_VOL_TACTICAL, FADE_SPIKE_PUTS, CASH, FLATTEN_SVIX
+from monitor.vix_regime import LONG_VOL_TACTICAL, FADE_SPIKE_PUTS
 
 SELL_SVIX_ALL = "SELL_SVIX_ALL"
-BUY_SVIX_SHARES = "BUY_SVIX_SHARES"
+BUY_SVIX_RUNG = "BUY_SVIX_RUNG"
+SELL_SVIX_PARTIAL = "SELL_SVIX_PARTIAL"
 BUY_UVXY_PUT = "BUY_UVXY_PUT"
 BUY_VXX_PUT = "BUY_VXX_PUT"
 BUY_VXX_CALL = "BUY_VXX_CALL"
@@ -31,13 +32,6 @@ class Action:
     ticker: str | None
     reason: str
     position: dict | None = None  # the held position this action targets, if any
-
-
-def _held(positions: list[dict], ticker: str, pos_type: str | None = None) -> list[dict]:
-    return [
-        p for p in positions
-        if p.get("ticker") == ticker and (pos_type is None or p.get("type") == pos_type)
-    ]
 
 
 def fetch_uvxy_history(uw_client, sessions: int = 10) -> list[float] | None:
@@ -102,36 +96,17 @@ def evaluate_fade_spike(uw_client, vix: float | None, uvxy_history: list[float] 
 
 def decide_actions(posture: str, positions: list[dict]) -> list[Action]:
     """
-    Map posture + current RH positions to actions. Conflict rule (Impl Plan
-    §4): if RH holds SVIX while posture is FLATTEN_SVIX or
-    LONG_VOL_TACTICAL, the action is sell first — no simultaneous
-    sell+buy in one decide_actions() call, the executor re-evaluates next
-    cycle after the sell confirms.
+    Map posture + current UVXY/VXX option holdings to actions. SVIX is no
+    longer posture-driven — monitor/vix_ladder.py owns all SVIX entries and
+    exits independently, on its own VIX-level campaign, regardless of what
+    posture says (see VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md). This
+    function is options-only now.
     """
     actions: list[Action] = []
-    svix_shares = _held(positions, "SVIX", "share")
     uvxy_options = [p for p in positions if p.get("ticker") == "UVXY" and p.get("type") == "option"]
     vxx_options = [p for p in positions if p.get("ticker") == "VXX" and p.get("type") == "option"]
 
-    if posture == FLATTEN_SVIX:
-        if svix_shares:
-            actions.append(Action(SELL_SVIX_ALL, "SVIX", "posture=FLATTEN_SVIX", svix_shares[0]))
-        else:
-            actions.append(Action(NOOP, "SVIX", "posture=FLATTEN_SVIX but no SVIX held"))
-        return actions  # sell first — do not also propose entries this cycle
-
-    if posture == SVIX_ON:
-        if svix_shares:
-            actions.append(Action(HOLD, "SVIX", "posture=SVIX_ON, already held", svix_shares[0]))
-        else:
-            actions.append(Action(BUY_SVIX_SHARES, "SVIX", "posture=SVIX_ON, no SVIX held"))
-        return actions
-
     if posture == FADE_SPIKE_PUTS:
-        if svix_shares:
-            # Conflict: flatten the opposite-direction position first.
-            actions.append(Action(SELL_SVIX_ALL, "SVIX", "posture=FADE_SPIKE_PUTS conflicts with held SVIX", svix_shares[0]))
-            return actions
         if uvxy_options:
             actions.append(Action(HOLD, "UVXY", "posture=FADE_SPIKE_PUTS, put already held", uvxy_options[0]))
         elif vxx_options:
@@ -141,9 +116,6 @@ def decide_actions(posture: str, positions: list[dict]) -> list[Action]:
         return actions
 
     if posture == LONG_VOL_TACTICAL:
-        if svix_shares:
-            actions.append(Action(SELL_SVIX_ALL, "SVIX", "posture=LONG_VOL_TACTICAL conflicts with held SVIX", svix_shares[0]))
-            return actions
         if not uvxy_options and not vxx_options:
             actions.append(Action(BUY_VXX_CALL, "VXX", "posture=LONG_VOL_TACTICAL, Aug-Oct bias, no calls held"))
         else:
@@ -151,10 +123,7 @@ def decide_actions(posture: str, positions: list[dict]) -> list[Action]:
         return actions
 
     # CASH
-    if svix_shares:
-        actions.append(Action(SELL_SVIX_ALL, "SVIX", "posture=CASH, gate/data does not support holding SVIX", svix_shares[0]))
-    else:
-        actions.append(Action(NOOP, None, "posture=CASH, nothing to do"))
+    actions.append(Action(NOOP, None, "posture=CASH, nothing to do"))
     return actions
 
 

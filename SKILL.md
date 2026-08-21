@@ -408,6 +408,27 @@ already; see root repo git history for the fix).
   returns.
 
 ### VIX Trader — Lessons learned
+- 2026-08-20: Replaced SVIX_ON/FLATTEN_SVIX (calm-market contango-carry posture) entirely with a
+  spike-buying ladder strategy (monitor/vix_ladder.py), per explicit direction after multi-turn
+  design review — VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md is the spec. Arms at VIX>30, buys
+  $5,000 rungs at 30/40/50/... until a 15%-of-NAV budget is spent, stops scaling on a 3% pullback
+  from the campaign high (same signal also starts take-profit), sells 25% of peak shares at each
+  +25pp P&L step. Also removed the -15% auto kill switch entirely (monitor/vix_kill_switch.py
+  deleted) — the ladder's budget cap is the risk control now, not a P&L stop, since the strategy
+  is *supposed* to hold through planned drawdown while scaling in. Found and fixed a real
+  architecture conflict before it shipped: SVIX is now fully decoupled from the posture engine, so
+  the old per-day re-entry lock in vix_executor.py would have blocked buying multiple rungs in one
+  day if VIX ripped through 30->40->50 — new BUY_SVIX_RUNG action type bypasses that lock entirely
+  (the ladder's own rung history is what prevents duplicate buys). Also fixed a whipsaw gap in the
+  first draft of the design: a strictly linear one-peak/one-sell-down model would leave a partially
+  sold position "stuck" if VIX re-accelerated to a new high after some take-profit selling — fixed
+  by making buy/sell conditions re-evaluate every cycle against running high-water marks
+  (campaign_peak_vix, campaign_peak_shares) instead of firing once, so budget freed by selling can
+  fund new rungs on a second leg up; take-profit step counter restarts against the new peak on
+  re-arm (confirmed design choice, not auto-derived). Live-verified the full lifecycle with
+  synthetic VIX values against the real Alpaca paper account (no real trades needed) — arm, two
+  rungs, pullback, partial take-profit, and the exact whipsaw re-arm scenario, confirming shares
+  don't get stuck and the take-profit counter resets correctly. 122/122 tests passing.
 - 2026-08-20: Wired VIX_SVIX_STOP_PCT (-15%) into a real SVIX P&L-based auto kill switch
   (monitor/vix_kill_switch.py) — closes the gap VIX_OPERATIONS_GUIDE.md flagged (the constant
   existed in config since the scaffold's first commit but was never wired into any decision

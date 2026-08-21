@@ -70,7 +70,16 @@ VIX_SHADOW_BOOK_FILE = VIX_DATA_DIR / "last_known_positions.json"
 VIX_STATE_FILE = VIX_DATA_DIR / "state.json"
 VIX_PAPER_LEDGER_FILE = VIX_DATA_DIR / "paper_ledger.jsonl"
 VIX_ROLL_ALERT_STATE_FILE = VIX_DATA_DIR / "roll_alert_state.json"
-VIX_AUTO_KILL_STATE_FILE = VIX_DATA_DIR / "auto_kill_switch.json"
+VIX_SVIX_LADDER_STATE_FILE = VIX_DATA_DIR / "svix_ladder_state.json"
+
+# ── SVIX ladder strategy (replaces the old contango-carry SVIX_ON/FLATTEN_SVIX
+# posture entirely — see VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md) ──────────
+VIX_LADDER_ARM_LEVEL = float(os.getenv("VIX_LADDER_ARM_LEVEL", 30))
+VIX_LADDER_RUNG_STEP = float(os.getenv("VIX_LADDER_RUNG_STEP", 10))
+VIX_LADDER_RUNG_DOLLARS = float(os.getenv("VIX_LADDER_RUNG_DOLLARS", 5000))
+VIX_LADDER_BUDGET_PCT = float(os.getenv("VIX_LADDER_BUDGET_PCT", 0.15))
+VIX_LADDER_PULLBACK_PCT = float(os.getenv("VIX_LADDER_PULLBACK_PCT", 0.03))
+VIX_LADDER_TP_STEPS = [0.25, 0.50, 0.75, 1.00]
 
 # ── Google Drive uploads (SRS §10.1 — non-fatal, off by default) ──────────
 ENABLE_GDRIVE_UPLOAD = os.getenv("ENABLE_GDRIVE_UPLOAD", "false").lower() == "true"

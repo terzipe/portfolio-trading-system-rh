@@ -17,19 +17,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from config import VIX_DATA_DIR, VIX_SPIKE_LEVEL, VIX_STALE_SECONDS, VIX_KILL_SWITCH
+from config import VIX_DATA_DIR, VIX_STALE_SECONDS, VIX_KILL_SWITCH
 from data.unusual_whales import get_client, UWError
-from monitor import vix_kill_switch
 
 REGIME_TRADER_PATH = Path(__file__).parent.parent.parent / "regime_trader"
 if str(REGIME_TRADER_PATH) not in sys.path:
     sys.path.insert(0, str(REGIME_TRADER_PATH))
 
-SVIX_ON = "SVIX_ON"
 LONG_VOL_TACTICAL = "LONG_VOL_TACTICAL"
 FADE_SPIKE_PUTS = "FADE_SPIKE_PUTS"
 CASH = "CASH"
-FLATTEN_SVIX = "FLATTEN_SVIX"
 
 # SRS §7.2 — bias only, never a lock.
 _CALENDAR_BIAS = {
@@ -112,56 +109,39 @@ def compute_posture(
     fade_spike_ok: bool = False,
 ) -> tuple[str, str, list[str]]:
     """
-    Posture priority, highest first (Impl Plan §3):
-    1. kill switch -> flatten-only
-    2. stale data -> no buy
-    3. VIX>=25 or backwardation -> FLATTEN_SVIX
-    4. fade-spike rules -> FADE_SPIKE_PUTS
-    5. contango + VIX<25 + gate ok -> SVIX_ON
-    6. Aug-Oct bias or explicit long-vol signal -> LONG_VOL_TACTICAL
-    7. else CASH
+    Posture priority, highest first (Impl Plan §3, SVIX branches retired —
+    see VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md; SVIX is now driven
+    entirely by monitor/vix_ladder.py, independent of posture):
+    1. kill switch -> CASH (suppresses new option entries)
+    2. stale data -> CASH
+    3. fade-spike rules -> FADE_SPIKE_PUTS
+    4. Aug-Oct bias or explicit long-vol signal -> LONG_VOL_TACTICAL
+    5. else CASH
+
+    vix/vix3m/vx1/vx2/gate_posture/gate_score are still accepted as params
+    (callers already have them from the UW term-structure fetch and macro
+    gate read, and RegimeResult still reports them for the dashboard) but
+    are no longer used to compute posture directly — FADE_SPIKE_PUTS has
+    its own independent spike detection (see
+    vix_signals.evaluate_fade_spike(), driven by fade_spike_ok),
+    backwardation/contango no longer has a posture-level meaning now that
+    SVIX_ON/FLATTEN_SVIX are gone, and the macro gate no longer gates
+    anything at the posture level either (it had only ever gated SVIX_ON).
     """
     reasons: list[str] = []
     bias_family, bias_sign = _CALENDAR_BIAS.get(calendar_month, ("neutral", "0"))
 
     if VIX_KILL_SWITCH:
-        reasons.append("VIX_KILL_SWITCH=true -> flatten-only")
-        return FLATTEN_SVIX, bias_family, reasons
-
-    if vix_kill_switch.is_tripped():
-        reasons.append("auto kill switch tripped (SVIX P&L stop) -> flatten-only")
-        return FLATTEN_SVIX, bias_family, reasons
+        reasons.append("VIX_KILL_SWITCH=true -> no new option entries")
+        return CASH, bias_family, reasons
 
     if data_age_sec > VIX_STALE_SECONDS:
         reasons.append(f"UW data stale ({data_age_sec:.0f}s > {VIX_STALE_SECONDS}s) -> no new buys")
         return CASH, bias_family, reasons
 
-    if vx1 is not None and vx2 is not None:
-        backwardation = vx1 > vx2
-        contango = vx2 > vx1
-        curve_detail = f"VX1={vx1}, VX2={vx2}"
-    elif vix is not None and vix3m is not None:
-        backwardation = vix > vix3m
-        contango = vix < vix3m
-        curve_detail = f"VIX={vix}, VIX3M={vix3m}, ratio={vix/vix3m:.3f}" if vix3m else "VIX3M unavailable"
-    else:
-        reasons.append("no term-structure data available -> no new buys")
-        return CASH, bias_family, reasons
-
-    if (vix is not None and vix >= VIX_SPIKE_LEVEL) or backwardation:
-        reasons.append(f"VIX>={VIX_SPIKE_LEVEL} or backwardation ({curve_detail}) -> FLATTEN_SVIX")
-        return FLATTEN_SVIX, bias_family, reasons
-
     if fade_spike_ok:
         reasons.append("fade-spike criteria met (see vix_signals) -> FADE_SPIKE_PUTS")
         return FADE_SPIKE_PUTS, bias_family, reasons
-
-    if contango and (vix is not None and vix < VIX_SPIKE_LEVEL) and gate_posture != "CASH":
-        reasons.append(
-            f"contango + VIX<{VIX_SPIKE_LEVEL} + gate={gate_posture} -> SVIX_ON "
-            f"(calendar_bias={bias_family}{bias_sign}, month={calendar_month})"
-        )
-        return SVIX_ON, bias_family, reasons
 
     if bias_family == "long_vol":
         reasons.append(f"Aug-Oct calendar bias, month={calendar_month} -> LONG_VOL_TACTICAL")
