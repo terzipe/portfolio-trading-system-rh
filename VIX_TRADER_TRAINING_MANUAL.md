@@ -48,6 +48,17 @@ cooling off.
 - It keeps doing this until it's committed **15% of the account's total
   value** to the position — the last purchase is sized down to whatever
   is left in that budget, then buying stops.
+- **Tail guard — it won't chase a spike past VIX 70.** No rung above 70 is
+  ever bought (30, 40, 50, 60, 70 are the highest levels it will buy into),
+  so if the VIX blows out into genuine crisis territory the bot stops adding
+  to a collapsing SVIX rather than catching a falling knife all the way
+  down. It still holds what it already owns and still takes profit normally
+  once things calm down. This is a level cap, not a permanent shut-off: if
+  the VIX later comes back down under 70, any lower rungs it skipped can be
+  bought again. *(One important note about buying one rung at a time: even
+  if the VIX gaps straight to 60 or 90 overnight, the bot doesn't bulk-buy
+  everything at once — it buys the lowest unbought rung first, one purchase
+  per 15-minute check-in, working its way up.)*
 - Unlike everything else in the bot, there's no "one trade per day" limit
   here — if VIX rips through 30 → 40 → 50 in a single session, it can buy
   all three rungs that same day.

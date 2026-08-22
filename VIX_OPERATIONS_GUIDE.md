@@ -31,6 +31,15 @@ persisted in `data/vix/svix_ladder_state.json`, replacing the old
   the exact residual.
 - Each rung level fires **at most once** per campaign — no re-buying the
   same rung on a whipsaw retest.
+- **Tail-guard ceiling:** rungs above `VIX_LADDER_MAX_ARM_LEVEL` (70) are
+  never bought — a VIX blowout into crisis territory (70+) stops adding new
+  risk, so max buying is the rungs 30/40/50/60/70 ($25k at the default rung
+  size, still bounded by the 15%-of-NAV budget). The ceiling caps the rung
+  *level*, it is **not** a one-way latch: if VIX later rounds back down under
+  70 while still in the buying regime, any skipped lower rungs become
+  eligible again (resume-on-the-way-down). Existing holdings, peak tracking,
+  and take-profit are unaffected — the ceiling only blocks *new* rungs above
+  it.
 - **No re-entry lock / one-per-day cap applies** — the ladder can buy
   several rungs in a single day if VIX rips through multiple levels; its
   own rung history is what prevents duplicates, not the generic per-day

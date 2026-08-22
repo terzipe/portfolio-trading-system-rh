@@ -49,6 +49,7 @@ from datetime import datetime, timezone
 from config import (
     VIX_SVIX_LADDER_STATE_FILE,
     VIX_LADDER_ARM_LEVEL,
+    VIX_LADDER_MAX_ARM_LEVEL,
     VIX_LADDER_RUNG_STEP,
     VIX_LADDER_RUNG_DOLLARS,
     VIX_LADDER_BUDGET_PCT,
@@ -110,10 +111,17 @@ def _next_unbought_rung(state: dict, vix: float) -> float | None:
     # Excludes rungs with a pending (submitted-but-unconfirmed) buy too --
     # otherwise a second cycle running before the first order's fill
     # confirms would submit a duplicate buy at the same level.
+    #
+    # Tail guard: rungs above VIX_LADDER_MAX_ARM_LEVEL are never eligible, so
+    # a VIX blowout into the extreme tail (70+) stops adding new risk. The
+    # ceiling is on the rung level, not a one-way latch -- if VIX later rounds
+    # back down under the ceiling, rungs at/below it that were skipped on the
+    # way up become eligible again (resume-on-the-way-down, per design).
     level = VIX_LADDER_ARM_LEVEL
     bought = set(state["rung_levels_bought"])
     bought |= {p["level"] for p in state["pending_orders"] if p["kind"] == "buy"}
-    while level <= vix:
+    ceiling = min(vix, VIX_LADDER_MAX_ARM_LEVEL)
+    while level <= ceiling:
         if level not in bought:
             return level
         level += VIX_LADDER_RUNG_STEP

@@ -408,6 +408,21 @@ already; see root repo git history for the fix).
   returns.
 
 ### VIX Trader — Lessons learned
+- 2026-08-22: Added a tail-risk ceiling to the SVIX ladder (VIX_LADDER_MAX_ARM_LEVEL,
+  default 70) after tracing the "VIX gaps to 60 over a weekend and climbs to 90" scenario:
+  because _next_unbought_rung() always returns the *lowest* unbought rung ≤ VIX and evaluate()
+  emits at most one buy per cycle, the ladder would otherwise keep catching a collapsing SVIX
+  one $5k tranche per 15-min cycle all the way up (30/40/.../90), with no stop-loss by design —
+  only the 15%-of-NAV budget cap. The ceiling makes rungs above 70 permanently ineligible
+  (ceiling = min(vix, MAX) in _next_unbought_rung), so a crisis blowout stops adding new risk
+  while existing holdings, peak tracking, and take-profit are untouched. Chosen semantics
+  (confirmed, not auto-derived): resume-on-the-way-down, i.e. a level cap not a one-way latch —
+  if VIX rounds back under 70 in the buying regime, skipped lower rungs are eligible again.
+  Note the interaction worth remembering: "resume on the way down" only fires inside the narrow
+  not-pulled-back band (VIX within 3% of peak), because any deeper drop routes to take-profit
+  instead — so in practice the ceiling's dominant effect is simply blocking the 80/90/100+ rungs.
+  4 new tests (135 total, was 131), including gap-to-90-still-buys-30-first and the exactly-at-70
+  inclusive boundary.
 - 2026-08-21: Found and fixed a real race condition live, the first time the ladder's real order
   path was proven end-to-end against actual Alpaca orders rather than synthetic VIX values.
   record_rung_bought() was called right after execute_actions() reported an order *accepted*

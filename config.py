@@ -75,6 +75,11 @@ VIX_SVIX_LADDER_STATE_FILE = VIX_DATA_DIR / "svix_ladder_state.json"
 # ── SVIX ladder strategy (replaces the old contango-carry SVIX_ON/FLATTEN_SVIX
 # posture entirely — see VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md) ──────────
 VIX_LADDER_ARM_LEVEL = float(os.getenv("VIX_LADDER_ARM_LEVEL", 30))
+# Tail guard: never open a rung whose level is above this (VIX 70+ = crisis
+# territory; refuse to keep catching a falling SVIX into the extreme tail).
+# Rungs at or below it stay eligible, so if VIX rounds back down through the
+# ceiling the ladder resumes buying any lower rungs it skipped on the way up.
+VIX_LADDER_MAX_ARM_LEVEL = float(os.getenv("VIX_LADDER_MAX_ARM_LEVEL", 70))
 VIX_LADDER_RUNG_STEP = float(os.getenv("VIX_LADDER_RUNG_STEP", 10))
 VIX_LADDER_RUNG_DOLLARS = float(os.getenv("VIX_LADDER_RUNG_DOLLARS", 5000))
 VIX_LADDER_BUDGET_PCT = float(os.getenv("VIX_LADDER_BUDGET_PCT", 0.15))

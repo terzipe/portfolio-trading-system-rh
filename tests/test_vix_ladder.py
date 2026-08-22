@@ -90,6 +90,50 @@ def test_no_rung_buy_when_budget_exhausted(isolated_state):
     assert actions == []
 
 
+# ── Tail-guard ceiling (VIX_LADDER_MAX_ARM_LEVEL, default 70) ─────────
+
+def test_gap_above_ceiling_still_buys_lowest_rung_first(isolated_state):
+    # VIX gaps straight to 90 with nothing held: the ladder does not bulk-buy
+    # or jump to the top -- it still starts at the lowest unbought rung.
+    actions = vix_ladder.evaluate(vix=90.0, nav=1_000_000, positions=[], live_price=90.0)
+    assert len(actions) == 1
+    assert actions[0].position["rung_level"] == 30
+
+
+def test_no_rung_above_ceiling_is_ever_bought(isolated_state):
+    # 30-70 already bought, VIX pinned at 90 -> the 80 and 90 rungs are above
+    # the 70 ceiling and must not be proposed.
+    vix_ladder.arm_campaign(90.0)
+    for lvl in (30, 40, 50, 60, 70):
+        vix_ladder.record_rung_bought(lvl, 100, float(lvl))
+    actions = vix_ladder.evaluate(vix=90.0, nav=1_000_000, positions=_held(500), live_price=90.0)
+    assert actions == []  # nothing left at/below the ceiling; 80/90 blocked
+
+
+def test_rung_at_exactly_the_ceiling_is_allowed(isolated_state):
+    vix_ladder.arm_campaign(90.0)
+    for lvl in (30, 40, 50, 60):
+        vix_ladder.record_rung_bought(lvl, 100, float(lvl))
+    actions = vix_ladder.evaluate(vix=90.0, nav=1_000_000, positions=_held(400), live_price=90.0)
+    assert len(actions) == 1
+    assert actions[0].position["rung_level"] == 70  # the ceiling itself is inclusive
+
+
+def test_ceiling_is_not_a_one_way_latch(isolated_state):
+    # The ceiling caps the rung *level*, it does not latch buying off once
+    # touched. With peak just above the ceiling (so VIX is still in the
+    # not-pulled-back buying regime) a skipped lower rung stays eligible as
+    # VIX rounds back down under the ceiling -- resume-on-the-way-down, per
+    # the chosen design (vs. a hard campaign latch).
+    vix_ladder.arm_campaign(72.0)          # peak 72, just over the 70 ceiling
+    vix_ladder.record_rung_bought(30, 100, 30.0)
+    # VIX at 70.6: not pulled back (70.6 > 72*0.97=69.84), so it's a buying
+    # cycle, and rung 40 (skipped earlier) is offered again.
+    actions = vix_ladder.evaluate(vix=70.6, nav=1_000_000, positions=_held(100), live_price=70.6)
+    assert len(actions) == 1
+    assert actions[0].position["rung_level"] == 40
+
+
 # ── Peak / pullback / take-profit ────────────────────────────────────
 
 def test_pullback_under_threshold_keeps_scaling_not_selling(isolated_state):
