@@ -96,6 +96,33 @@ sessions *or* VIX spiked to ≥25 from a sub-20 base, **and** the most recent
 close is a lower high (spike already fading). `LONG_VOL_TACTICAL` fires
 Aug/Sep/Oct when nothing else is held and no put/call is already open.
 
+### Contract sizing (`vix_executor._size_option_contracts()`)
+
+Each option entry sizes to the **smaller** of two limits:
+- **Sleeve budget:** `VIX_SLEEVE_MAX_PCT` (5%) × NAV, minus option value
+  already held, divided by one contract's premium (mid × 100), rounded down.
+- **Flat cap:** `VIX_MAX_CONTRACTS` (5) contracts, regardless of budget.
+
+The flat cap is almost always what binds — e.g. a ~$399k account buying a
+VXX call at ~$0.83 mid: the 5% budget would allow ~240 contracts, but the
+5-contract cap caps it at 5 (~$412 total). Sizing to 0 (premium exceeds
+headroom, or a zero/untradeable quote) is skipped with a reason, not
+ordered.
+
+### Re-entry lock (when the next option entry is allowed)
+
+Options entries are held to **one new entry per calendar day**, and once a
+position is closed/flattened *this* day, no new entry into it happens again
+until the next day (`vix_executor._entry_locked()` /
+`last_flatten_session`). This is a whipsaw guard — in normal operation it
+rarely binds, since `LONG_VOL_TACTICAL` only changes on a month boundary.
+It *will* bind for the rest of the day after any manual close done for
+testing. Skips show as `re-entry locked — flattened this session` or
+`1 new entry per session already used`. Because the loops run **weekdays
+only**, the practical earliest re-entry after a same-day close is the next
+weekday's 9:00 AM cycle. **The SVIX ladder is exempt** (see §1) — its own
+rung history prevents duplicates instead.
+
 ### Exit / management (P&L-driven, `vix_signals.decide_option_management()`,
 independent of posture — runs on every open UVXY/VXX option regardless of
 what posture currently says)
@@ -190,8 +217,12 @@ Add `--dry-run` to preview without submitting/recording anything.
   positions and `/account/activities` — includes trades placed manually
   (dashboard button, or directly in Alpaca's UI), not just bot-placed ones.
 - **SVIX Ladder**: campaign status — armed/idle, peak VIX, rungs bought,
-  take-profit steps completed. The place to check "where is the ladder
-  right now" without reading `data/vix/svix_ladder_state.json` directly.
+  take-profit steps completed, plus any orders **submitted but not yet
+  confirmed filled** (the `pending_orders` line, added with the 2026-08-21
+  race-condition fix — a rung/sell is only promoted to a "real" holding once
+  Alpaca confirms the fill, so a queued after-hours order shows here in the
+  meantime). The place to check "where is the ladder right now" without
+  reading `data/vix/svix_ladder_state.json` directly.
 - **Bot decision log**: every action the bot considered, including
   skipped/rejected ones with a reason — this is the *only* place to see
   proposed-but-not-executed actions (they never hit Alpaca's activity feed).
