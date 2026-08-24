@@ -94,6 +94,31 @@ VIX_LADDER_BUDGET_PCT = float(os.getenv("VIX_LADDER_BUDGET_PCT", 0.15))
 VIX_LADDER_PULLBACK_PCT = float(os.getenv("VIX_LADDER_PULLBACK_PCT", 0.03))
 VIX_LADDER_TP_STEPS = [0.25, 0.50, 0.75, 1.00]
 
+# ── LONG_VOL_TACTICAL data-driven gates (replaces the old pure Aug-Oct
+# calendar trigger -- see monitor/vix_longvol_gates.py). Score >= 2 of 3
+# fires the posture; calendar is dropped from the decision entirely.
+# Gate A: VIX below this percentile of trailing 10y history == "cheap"
+# (reuses monitor/vix_percentile.py's FRED-backed weekly-refreshed cache).
+# 15th pct chosen from the 2026-08-25 parameter sweep (backtest_longvol_
+# gates.py --sweep) -- the 25th/45th defaults tested first were both too
+# loose (near-median VIX counts as "cheap"), firing ~80-130x over 8.5y with
+# a sub-35% win rate. This combo (15/10%/15/5%) was the first found with
+# both win rate (57%) and average forward return (+5.6% at 21d) positive
+# on a sample (n=23) large enough to take seriously.
+VIX_LONGVOL_CHEAP_PERCENTILE = float(os.getenv("VIX_LONGVOL_CHEAP_PERCENTILE", 15))
+# Gate B (term structure) and Gate C (VXX momentum) both compare "now" to
+# this many trading sessions ago -- one shared, configurable lookback.
+VIX_LONGVOL_LOOKBACK_SESSIONS = int(os.getenv("VIX_LONGVOL_LOOKBACK_SESSIONS", 15))
+# Gate C: VXX must be up at least this much over the lookback to confirm
+# (a magnitude floor so it doesn't fire on noise).
+VIX_LONGVOL_MOMENTUM_MIN_PCT = float(os.getenv("VIX_LONGVOL_MOMENTUM_MIN_PCT", 0.10))
+# Gate B: the VIX/VIX3M ratio must have fallen by at least this fraction of
+# its value N sessions ago to confirm (0.0 = any decrease at all counts,
+# the original definition -- backtesting 2026-08-25 found this too loose,
+# firing on essentially any wiggle).
+VIX_LONGVOL_TERM_STRUCTURE_MIN_PCT = float(os.getenv("VIX_LONGVOL_TERM_STRUCTURE_MIN_PCT", 0.05))
+VIX_LONGVOL_MIN_GATES = int(os.getenv("VIX_LONGVOL_MIN_GATES", 2))
+
 # ── Google Drive uploads (SRS §10.1 — non-fatal, off by default) ──────────
 ENABLE_GDRIVE_UPLOAD = os.getenv("ENABLE_GDRIVE_UPLOAD", "false").lower() == "true"
 GDRIVE_SERVICE_ACCOUNT_JSON = os.path.expanduser(

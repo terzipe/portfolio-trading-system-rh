@@ -34,21 +34,19 @@ class Action:
     position: dict | None = None  # the held position this action targets, if any
 
 
-def fetch_uvxy_history(uw_client, sessions: int = 10) -> list[float] | None:
+def fetch_ticker_history(uw_client, ticker: str, sessions: int = 10) -> list[float] | None:
     """
-    Last `sessions` UVXY regular-session daily closes (oldest first), for
-    evaluate_fade_spike()'s window (SRS §7.5: "UVXY +30% in <=10
-    sessions"). Confirmed live 2026-08-19: GET /api/stock/UVXY/ohlc/1d
-    returns one row per session *segment* per day (market_time: "pr"
-    pre-market / "r" regular / "po" post-market), not one row per day — a
-    naive "last N rows" would mix pre/post segments and undercount actual
-    trading days, so this filters to market_time=="r" before taking the
-    tail. Returns None on any fetch/parse failure or too few closes — fail
-    closed, matching evaluate_fade_spike()'s own None-history contract (no
-    fade-spike entry without confirming data, per SRS §6.4).
+    Last `sessions` regular-session daily closes (oldest first) for any
+    ticker. Confirmed live 2026-08-19 (on UVXY): GET /api/stock/{ticker}/
+    ohlc/1d returns one row per session *segment* per day (market_time:
+    "pr" pre-market / "r" regular / "po" post-market), not one row per
+    day — a naive "last N rows" would mix pre/post segments and undercount
+    actual trading days, so this filters to market_time=="r" before taking
+    the tail. Returns None on any fetch/parse failure or too few closes —
+    fail closed, so callers never make a momentum decision on partial data.
     """
     try:
-        payload = uw_client.ohlc("UVXY", candle_size="1d")
+        payload = uw_client.ohlc(ticker, candle_size="1d")
     except UWError:
         return None
     rows = payload.get("data", [])
@@ -60,6 +58,13 @@ def fetch_uvxy_history(uw_client, sessions: int = 10) -> list[float] | None:
         except (KeyError, TypeError, ValueError):
             continue
     return closes if len(closes) >= 2 else None
+
+
+def fetch_uvxy_history(uw_client, sessions: int = 10) -> list[float] | None:
+    """UVXY-specific alias of fetch_ticker_history(), for
+    evaluate_fade_spike()'s window (SRS §7.5: "UVXY +30% in <=10
+    sessions")."""
+    return fetch_ticker_history(uw_client, "UVXY", sessions)
 
 
 def evaluate_fade_spike(uw_client, vix: float | None, uvxy_history: list[float] | None = None) -> bool:

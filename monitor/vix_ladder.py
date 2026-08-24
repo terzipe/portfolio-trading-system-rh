@@ -318,9 +318,29 @@ def evaluate(
     held = _held_svix_shares(positions)
     held_qty = held.get("quantity", 0.0) if held else 0.0
 
-    # Self-heal: real position is flat but state thinks otherwise (e.g. a
+    # Self-heal #1: real position is flat but state thinks otherwise (e.g. a
     # manual flatten happened out of band). Reset before doing anything else.
     if state["armed"] and held_qty <= 0 and _current_shares(state) > 0:
+        if not dry_run:
+            reset_campaign()
+            state = _load_state()
+        else:
+            state = _default_state()
+
+    # Self-heal #2: the campaign's OWN ledger already shows fully exited
+    # (take-profit sold the last share -- state and the real broker AGREE
+    # on zero, so #1 above never fires) but nothing ever cleared "armed".
+    # Found via backtesting 2026-08-25: without this, a second campaign
+    # inherits the first campaign's stale campaign_peak_vix (so it takes a
+    # much bigger VIX move to even start buying again) AND its
+    # rungs_bought/campaign_peak_shares (so it skips straight to whatever
+    # rung wasn't touched last time instead of starting at the 90th, and
+    # the take-profit quarter-sizing is corrupted by the old peak-shares
+    # figure). Excludes a buy still in flight (pending, not yet confirmed)
+    # so this can't fire in the brief window between arming and the first
+    # rung actually filling.
+    no_pending_buys = not any(p["kind"] == "buy" for p in state["pending_orders"])
+    if state["armed"] and _current_shares(state) <= 0 and no_pending_buys:
         if not dry_run:
             reset_campaign()
             state = _load_state()

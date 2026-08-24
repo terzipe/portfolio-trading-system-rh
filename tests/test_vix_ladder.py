@@ -301,6 +301,70 @@ def test_selfheal_does_not_fire_in_dry_run(isolated_state):
     assert vix_ladder.get_status()["armed"] is True
 
 
+# ── Self-heal #2: natural full exit via take-profit must also idle out
+# (found via backtesting 2026-08-25 — a completed campaign was silently
+# staying "armed" forever, corrupting the next campaign's rung history,
+# peak_vix, and take-profit quarter-sizing) ─────────────────────────
+
+def test_armed_resets_to_idle_after_full_takeprofit_exit(isolated_state):
+    vix_ladder.arm_campaign(40.0)
+    vix_ladder.record_rung_bought(90, 30.0, 100, 30.0)
+    vix_ladder.record_take_profit_step(4, 100)  # sells everything, steps_done=4
+    assert vix_ladder.get_status()["armed"] is True  # not yet healed -- next evaluate() does it
+
+    actions = vix_ladder.evaluate(vix=20.0, nav=100_000, positions=[], live_price=20.0)
+    assert actions == []
+    status = vix_ladder.get_status()
+    assert status["armed"] is False
+    assert status["rungs_bought"] == []
+    assert status["campaign_peak_shares"] == 0
+
+
+def test_second_campaign_starts_at_lowest_rung_not_wherever_first_campaign_ended(isolated_state):
+    vix_ladder.arm_campaign(70.0)
+    for pct, level in FAKE_THRESHOLDS.items():
+        vix_ladder.record_rung_bought(pct, level, 100, level)
+    vix_ladder.record_take_profit_step(4, 500)  # fully exits all 5 rungs' worth
+
+    # A fresh VIX crossing of the 90th rung should start a brand-new
+    # campaign at the 90th, not think everything is already bought (which
+    # would have skipped straight to a rung above 99th -- i.e. nothing).
+    actions = vix_ladder.evaluate(vix=31.0, nav=1_000_000, positions=[], live_price=31.0)
+    assert len(actions) == 1
+    assert actions[0].position["rung_percentile"] == 90
+    assert vix_ladder.get_status()["armed"] is True
+
+
+def test_pending_buy_in_flight_is_not_wiped_by_the_new_selfheal(isolated_state):
+    vix_ladder.arm_campaign(31.0)
+    vix_ladder.record_rung_submitted(90, 30.0, "order-1", 5000)
+    # armed=True, 0 CONFIRMED shares, but a buy is genuinely still pending
+    # -- must not be mistaken for a completed exit.
+    vix_ladder.evaluate(vix=31.5, nav=1_000_000, positions=[], live_price=31.5)
+    status = vix_ladder.get_status()
+    assert status["armed"] is True
+    assert len(status["pending_orders"]) == 1
+
+
+def test_takeprofit_quarter_sizing_not_corrupted_by_stale_peak_shares(isolated_state):
+    # First campaign: 100 shares, fully exits.
+    vix_ladder.arm_campaign(40.0)
+    vix_ladder.record_rung_bought(90, 30.0, 100, 30.0)
+    vix_ladder.record_take_profit_step(4, 100)
+    vix_ladder.evaluate(vix=20.0, nav=100_000, positions=[], live_price=20.0)  # triggers the heal
+    assert vix_ladder.get_status()["armed"] is False
+
+    # Second campaign: 200 shares fresh -- peak_shares must be 200, not
+    # 100 (stale) + 200 = 300.
+    vix_ladder.arm_campaign(40.0)
+    vix_ladder.record_rung_bought(90, 30.0, 200, 30.0)
+    assert vix_ladder.get_status()["campaign_peak_shares"] == 200
+
+    actions = vix_ladder.evaluate(vix=38.0, nav=100_000, positions=_held(200), live_price=37.5)  # +25% pnl
+    assert len(actions) == 1
+    assert actions[0].position["sell_quantity"] == 50  # 25% of 200, not corrupted by the old campaign
+
+
 # ── Full reset ───────────────────────────────────────────────────────
 
 def test_reset_campaign_clears_everything(isolated_state):

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from config import VIX_DATA_DIR, VIX_STALE_SECONDS, VIX_KILL_SWITCH
 from data.unusual_whales import get_client, UWError
+from monitor.vix_longvol_gates import LongVolGateResult, evaluate as evaluate_longvol_gates
 
 REGIME_TRADER_PATH = Path(__file__).parent.parent.parent / "regime_trader"
 if str(REGIME_TRADER_PATH) not in sys.path:
@@ -107,6 +108,7 @@ def compute_posture(
     calendar_month: int,
     data_age_sec: float,
     fade_spike_ok: bool = False,
+    longvol_gates: "LongVolGateResult | None" = None,
 ) -> tuple[str, str, list[str]]:
     """
     Posture priority, highest first (Impl Plan §3, SVIX branches retired —
@@ -115,7 +117,7 @@ def compute_posture(
     1. kill switch -> CASH (suppresses new option entries)
     2. stale data -> CASH
     3. fade-spike rules -> FADE_SPIKE_PUTS
-    4. Aug-Oct bias or explicit long-vol signal -> LONG_VOL_TACTICAL
+    4. data-driven long-vol gates (2-of-3 scored) -> LONG_VOL_TACTICAL
     5. else CASH
 
     vix/vix3m/vx1/vx2/gate_posture/gate_score are still accepted as params
@@ -127,6 +129,16 @@ def compute_posture(
     backwardation/contango no longer has a posture-level meaning now that
     SVIX_ON/FLATTEN_SVIX are gone, and the macro gate no longer gates
     anything at the posture level either (it had only ever gated SVIX_ON).
+
+    LONG_VOL_TACTICAL used to fire on a pure Aug-Oct calendar bias alone —
+    replaced 2026-08-25 with monitor/vix_longvol_gates.py's scored,
+    data-driven gates (cheap-vol floor, term-structure flattening, VXX
+    momentum). Calendar is dropped from this decision entirely; the
+    calendar_month/bias_family machinery below is kept only for the
+    RegimeResult.calendar_bias dashboard field, not as a trigger.
+    `longvol_gates` defaults to None (not confirmed) so existing callers
+    that don't yet pass it simply never trigger LONG_VOL_TACTICAL via this
+    path, rather than raising.
     """
     reasons: list[str] = []
     bias_family, bias_sign = _CALENDAR_BIAS.get(calendar_month, ("neutral", "0"))
@@ -143,10 +155,15 @@ def compute_posture(
         reasons.append("fade-spike criteria met (see vix_signals) -> FADE_SPIKE_PUTS")
         return FADE_SPIKE_PUTS, bias_family, reasons
 
-    if bias_family == "long_vol":
-        reasons.append(f"Aug-Oct calendar bias, month={calendar_month} -> LONG_VOL_TACTICAL")
+    if longvol_gates is not None and longvol_gates.confirmed:
+        reasons.append(
+            f"long-vol gates {longvol_gates.score}/3 confirmed (see monitor/vix_longvol_gates.py) -> LONG_VOL_TACTICAL"
+        )
+        reasons.extend(longvol_gates.reasons)
         return LONG_VOL_TACTICAL, bias_family, reasons
 
+    if longvol_gates is not None:
+        reasons.extend(longvol_gates.reasons)  # visibility into why it didn't confirm
     reasons.append("no posture condition met -> CASH")
     return CASH, bias_family, reasons
 
@@ -154,6 +171,7 @@ def compute_posture(
 def run(fade_spike_ok: bool = False) -> RegimeResult:
     gate_posture, gate_score = _read_gate()
 
+    uw = None
     try:
         uw = get_client()
         term = uw.vix_term()
@@ -163,13 +181,20 @@ def run(fade_spike_ok: bool = False) -> RegimeResult:
         term = {"vix": None, "vix3m": None, "vx1": None, "vx2": None}
         data_age_sec = float("inf")
 
+    longvol_gates = None
+    if uw is not None:
+        try:
+            longvol_gates = evaluate_longvol_gates(uw, term.get("vix"), term.get("vix3m"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[vix_regime] long-vol gate evaluation failed, treating as not confirmed: {exc}")
+
     calendar_month = _calendar_month()
     posture, bias_family, reasons = compute_posture(
         vix=term.get("vix"), vix3m=term.get("vix3m"),
         vx1=term.get("vx1"), vx2=term.get("vx2"),
         gate_posture=gate_posture, gate_score=gate_score,
         calendar_month=calendar_month, data_age_sec=data_age_sec,
-        fade_spike_ok=fade_spike_ok,
+        fade_spike_ok=fade_spike_ok, longvol_gates=longvol_gates,
     )
 
     if term.get("vx1") is not None and term.get("vx2") is not None:
