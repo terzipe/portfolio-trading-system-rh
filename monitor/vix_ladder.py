@@ -1,16 +1,33 @@
 """
 VIX Trader BOT — SVIX ladder strategy (replaces the old contango-carry
 SVIX_ON/FLATTEN_SVIX posture entirely; see
-VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md for the full spec this implements).
+VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md v2.0 for the full spec this
+implements).
 
 Unlike the posture engine (a fresh, memoryless decision every cycle), this
 is a genuinely stateful, multi-cycle campaign: scale into SVIX in $5,000
-tranches at VIX rungs of 30, 40, 50, ... as VIX climbs, stop scaling and
-start taking profit in quarters once a 3% pullback from the campaign high
-confirms a peak, and — the key fix for whipsaw price action — resume
-buying new (higher) rungs if VIX later makes a fresh campaign high, using
-budget freed up by any earlier take-profit sells. State persists across
-loop cycles/days in VIX_SVIX_LADDER_STATE_FILE.
+tranches at VIX rungs defined by percentile of the trailing-10y VIX
+distribution (90th/92.5th/95th/97.5th/99th — see monitor/vix_percentile.py)
+as VIX climbs, stop scaling and start taking profit in quarters once a 3%
+pullback from the campaign high confirms a peak, and — the key fix for
+whipsaw price action — resume buying new (higher) rungs if VIX later makes
+a fresh campaign high, using budget freed up by any earlier take-profit
+sells. State persists across loop cycles/days in VIX_SVIX_LADDER_STATE_FILE.
+
+Rungs are identified by PERCENTILE, not by VIX level. This matters because
+the percentile->VIX-level threshold table (monitor/vix_percentile.py)
+refreshes weekly — the VIX level equivalent to "the 95th percentile rung"
+drifts slightly week to week as the trailing 10y window rolls. Tracking
+"bought" by raw VIX level would let a rung fire twice (or wrongly stay
+blocked) purely because the underlying distribution moved, not because
+anything about the campaign changed. So state["rungs_bought"] stores
+percentile identities (e.g. 95), and each open lot separately records the
+VIX level *at the time that rung fired* for audit purposes only.
+
+99th percentile is the top rung and IS the tail-guard ceiling outright —
+there is no rung above it and no separate ceiling constant (v1.0 had
+VIX_LADDER_MAX_ARM_LEVEL=70; v2.0 gets the same "stop escalating risk at
+the extreme" effect for free from the rung list simply ending at 99th).
 
 State-mutation split, deliberately:
   - evaluate() persists two kinds of "pure observation" updates directly,
@@ -19,8 +36,8 @@ State-mutation split, deliberately:
     zero SVIX held while the campaign thinks it's still open (e.g. after a
     manual "Flatten SVIX now" click, or a trade placed directly in Alpaca).
   - Trade-related state (a rung actually bought, a take-profit step actually
-    taken) is only finalized into open_lots/rung_levels_bought once a real
-    fill is confirmed via reconcile_pending_orders() — never on order
+    taken) is only finalized into open_lots/rungs_bought once a real fill
+    is confirmed via reconcile_pending_orders() — never on order
     *submission*. This closes a real bug hit live 2026-08-21: recording a
     rung as bought right after submission (order accepted, not yet filled)
     left a window — order submitted after-hours, sitting queued — where a
@@ -30,9 +47,9 @@ State-mutation split, deliberately:
     campaign, silently forgetting about a real position that filled minutes
     later. record_rung_submitted()/record_takeprofit_submitted() track an
     order as *pending* (in state["pending_orders"], separate from
-    open_lots/rung_levels_bought, so self-heal and _next_unbought_rung()
-    both correctly ignore it until it's real) — reconcile_pending_orders()
-    is what promotes a pending order to a real holding once Alpaca actually
+    open_lots/rungs_bought, so self-heal and _next_unbought_rung() both
+    correctly ignore it until it's real) — reconcile_pending_orders() is
+    what promotes a pending order to a real holding once Alpaca actually
     reports it filled, or drops it if rejected/canceled/expired.
 
 Known limitation: self-heal reconciliation only handles the "real shares
@@ -43,19 +60,16 @@ scope for now.
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime, timezone
 
 from config import (
     VIX_SVIX_LADDER_STATE_FILE,
-    VIX_LADDER_ARM_LEVEL,
-    VIX_LADDER_MAX_ARM_LEVEL,
-    VIX_LADDER_RUNG_STEP,
     VIX_LADDER_RUNG_DOLLARS,
     VIX_LADDER_BUDGET_PCT,
     VIX_LADDER_PULLBACK_PCT,
     VIX_LADDER_TP_STEPS,
 )
+from monitor import vix_percentile
 from monitor.vix_signals import Action, BUY_SVIX_RUNG, SELL_SVIX_PARTIAL
 
 
@@ -64,8 +78,8 @@ def _default_state() -> dict:
         "armed": False,
         "campaign_peak_vix": None,
         "campaign_peak_shares": 0.0,
-        "rung_levels_bought": [],
-        "open_lots": [],  # FIFO: [{"level","qty_remaining","price","at"}]
+        "rungs_bought": [],  # percentile identities, e.g. [90, 92.5]
+        "open_lots": [],  # FIFO: [{"percentile","vix_level","qty_remaining","price","at"}]
         "take_profit_steps_done": 0,
         "pending_orders": [],  # [{"kind":"buy"|"sell","order_id",...}] -- submitted, not yet confirmed filled
     }
@@ -107,24 +121,30 @@ def _held_svix_shares(positions: list[dict]) -> dict | None:
     return None
 
 
-def _next_unbought_rung(state: dict, vix: float) -> float | None:
-    # Excludes rungs with a pending (submitted-but-unconfirmed) buy too --
-    # otherwise a second cycle running before the first order's fill
-    # confirms would submit a duplicate buy at the same level.
-    #
-    # Tail guard: rungs above VIX_LADDER_MAX_ARM_LEVEL are never eligible, so
-    # a VIX blowout into the extreme tail (70+) stops adding new risk. The
-    # ceiling is on the rung level, not a one-way latch -- if VIX later rounds
-    # back down under the ceiling, rungs at/below it that were skipped on the
-    # way up become eligible again (resume-on-the-way-down, per design).
-    level = VIX_LADDER_ARM_LEVEL
-    bought = set(state["rung_levels_bought"])
-    bought |= {p["level"] for p in state["pending_orders"] if p["kind"] == "buy"}
-    ceiling = min(vix, VIX_LADDER_MAX_ARM_LEVEL)
-    while level <= ceiling:
-        if level not in bought:
-            return level
-        level += VIX_LADDER_RUNG_STEP
+def _next_unbought_rung(state: dict, vix: float, thresholds: dict[float, float]) -> tuple[float, float] | None:
+    """Returns (percentile, vix_level) for the lowest unbought rung whose
+    threshold VIX level has been reached, or None. Excludes rungs with a
+    pending (submitted-but-unconfirmed) buy too -- otherwise a second cycle
+    running before the first order's fill confirms would submit a
+    duplicate buy at the same rung.
+
+    `thresholds` is ascending by percentile (and, since the underlying
+    distribution is monotonic, ascending by VIX level too), so the first
+    unbought entry we find is always the lowest -- a VIX gap straight to an
+    extreme level still buys the lowest unbought rung first, it does not
+    bulk-buy or jump to the top. 99th is the last key in `thresholds`; once
+    it's bought (or unreached), there is nothing higher to consider, which
+    is what makes it the ceiling.
+    """
+    bought = set(state["rungs_bought"])
+    bought |= {p["percentile"] for p in state["pending_orders"] if p["kind"] == "buy"}
+    for percentile in sorted(thresholds):
+        if percentile in bought:
+            continue
+        level = thresholds[percentile]
+        if level <= vix:
+            return percentile, level
+        return None  # ascending order: no higher rung is reached either
     return None
 
 
@@ -135,16 +155,17 @@ def arm_campaign(vix: float) -> None:
     _save_state(state)
 
 
-def record_rung_bought(level: float, qty: float, price: float) -> None:
+def record_rung_bought(percentile: float, vix_level: float, qty: float, price: float) -> None:
     """Finalizes a CONFIRMED fill into real state. Not called directly by
     the loop scripts anymore — only from reconcile_pending_orders() once a
     pending buy is actually confirmed filled by Alpaca. Kept as its own
     function (rather than inlined) since it's independently unit-tested and
     is also the natural "finalize" step reconcile_pending_orders() calls."""
     state = _load_state()
-    state["rung_levels_bought"].append(level)
+    state["rungs_bought"].append(percentile)
     state["open_lots"].append({
-        "level": level, "qty_remaining": qty, "price": price,
+        "percentile": percentile, "vix_level": vix_level,
+        "qty_remaining": qty, "price": price,
         "at": datetime.now(timezone.utc).isoformat(),
     })
     state["campaign_peak_shares"] += qty
@@ -177,16 +198,20 @@ def record_take_profit_step(step_n: int, sell_qty: float) -> None:
     _save_state(state)
 
 
-def record_rung_submitted(level: float, order_id: str, target_dollars: float) -> None:
+def record_rung_submitted(percentile: float, vix_level: float, order_id: str, target_dollars: float) -> None:
     """Called by the loop scripts right after execute_actions() confirms a
     BUY_SVIX_RUNG order was *accepted* by Alpaca — not yet a real fill.
-    Tracked in pending_orders, separate from open_lots/rung_levels_bought,
-    so it can't be mistaken for a real holding (by self-heal) or leave a
-    rung level open to a duplicate buy (by _next_unbought_rung()) while the
-    fill is still in flight."""
+    Tracked in pending_orders, separate from open_lots/rungs_bought, so it
+    can't be mistaken for a real holding (by self-heal) or leave a rung
+    open to a duplicate buy (by _next_unbought_rung()) while the fill is
+    still in flight. vix_level is carried through here (not re-looked-up
+    later) so a finalized lot always records the VIX level that was
+    actually in effect when the rung fired, even if the weekly threshold
+    table has since refreshed."""
     state = _load_state()
     state["pending_orders"].append({
-        "kind": "buy", "level": level, "order_id": order_id, "target_dollars": target_dollars,
+        "kind": "buy", "percentile": percentile, "vix_level": vix_level,
+        "order_id": order_id, "target_dollars": target_dollars,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
     })
     _save_state(state)
@@ -229,7 +254,7 @@ def reconcile_pending_orders(client) -> None:
             filled_price = getattr(order, "filled_avg_price", None)
             if pending["kind"] == "buy":
                 price = float(filled_price) if filled_price else pending["target_dollars"] / filled_qty
-                record_rung_bought(pending["level"], filled_qty, price)
+                record_rung_bought(pending["percentile"], pending["vix_level"], filled_qty, price)
             else:
                 record_take_profit_step(pending["step"], filled_qty)
         elif status_value in ("rejected", "canceled", "expired"):
@@ -252,11 +277,12 @@ def get_status() -> dict:
         "armed": state["armed"],
         "campaign_peak_vix": state["campaign_peak_vix"],
         "campaign_peak_shares": state["campaign_peak_shares"],
-        "rung_levels_bought": state["rung_levels_bought"],
+        "rungs_bought": state["rungs_bought"],
         "current_shares": _current_shares(state),
         "current_cost_basis": _current_cost_basis(state),
         "take_profit_steps_done": state["take_profit_steps_done"],
         "pending_orders": state["pending_orders"],
+        "percentile_thresholds": vix_percentile.get_thresholds(),
     }
 
 
@@ -284,6 +310,10 @@ def evaluate(
     if vix is None:
         return []
 
+    thresholds = vix_percentile.get_thresholds()
+    if thresholds is None:
+        return []  # no successful FRED refresh yet -- nothing to evaluate against
+
     state = _load_state()
     held = _held_svix_shares(positions)
     held_qty = held.get("quantity", 0.0) if held else 0.0
@@ -298,7 +328,11 @@ def evaluate(
             state = _default_state()
 
     if not state["armed"]:
-        if vix > VIX_LADDER_ARM_LEVEL:
+        arm_level = thresholds[min(thresholds)]  # lowest configured percentile (90th)
+        # Refuse to arm a NEW campaign on a stale threshold table (two+
+        # missed weekly refreshes) -- an already-armed campaign below is
+        # unaffected and keeps running on whatever table it has.
+        if vix > arm_level and not vix_percentile.is_stale():
             if not dry_run:
                 arm_campaign(vix)
                 state = _load_state()
@@ -319,20 +353,24 @@ def evaluate(
     pulled_back = vix <= peak_vix * (1 - VIX_LADDER_PULLBACK_PCT)
 
     if not pulled_back:
-        next_rung = _next_unbought_rung(state, vix)
+        next_rung = _next_unbought_rung(state, vix, thresholds)
         if next_rung is None:
             return []
+        percentile, level = next_rung
         budget_remaining = VIX_LADDER_BUDGET_PCT * nav - _current_cost_basis(state)
         if budget_remaining <= 0:
             return []
         target_dollars = min(VIX_LADDER_RUNG_DOLLARS, budget_remaining)
         return [Action(
             BUY_SVIX_RUNG, "SVIX",
-            f"ladder rung {next_rung:.0f}: VIX={vix:.2f}, target=${target_dollars:.2f}",
-            {"target_dollars": target_dollars, "rung_level": next_rung},
+            f"ladder rung {percentile:g}th pct (VIX={level:.2f}): observed VIX={vix:.2f}, target=${target_dollars:.2f}",
+            {"target_dollars": target_dollars, "rung_percentile": percentile, "rung_vix_level": level},
         )]
 
     # Pulled back — evaluate take-profit steps against currently-held shares.
+    # Unchanged from v1.0: driven by VIX's change from peak and the
+    # position's own P&L, not by percentile, so the entry-side redesign
+    # doesn't touch this branch at all (explicit decision, 2026-08-24).
     if live_price is None or live_price <= 0:
         return []
     avg_cost = _avg_cost_per_share(state)

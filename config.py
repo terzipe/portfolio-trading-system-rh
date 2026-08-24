@@ -71,16 +71,24 @@ VIX_STATE_FILE = VIX_DATA_DIR / "state.json"
 VIX_PAPER_LEDGER_FILE = VIX_DATA_DIR / "paper_ledger.jsonl"
 VIX_ROLL_ALERT_STATE_FILE = VIX_DATA_DIR / "roll_alert_state.json"
 VIX_SVIX_LADDER_STATE_FILE = VIX_DATA_DIR / "svix_ladder_state.json"
+VIX_PERCENTILE_STATE_FILE = VIX_DATA_DIR / "vix_percentile_state.json"
 
 # ── SVIX ladder strategy (replaces the old contango-carry SVIX_ON/FLATTEN_SVIX
-# posture entirely — see VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md) ──────────
-VIX_LADDER_ARM_LEVEL = float(os.getenv("VIX_LADDER_ARM_LEVEL", 30))
-# Tail guard: never open a rung whose level is above this (VIX 70+ = crisis
-# territory; refuse to keep catching a falling SVIX into the extreme tail).
-# Rungs at or below it stay eligible, so if VIX rounds back down through the
-# ceiling the ladder resumes buying any lower rungs it skipped on the way up.
-VIX_LADDER_MAX_ARM_LEVEL = float(os.getenv("VIX_LADDER_MAX_ARM_LEVEL", 70))
-VIX_LADDER_RUNG_STEP = float(os.getenv("VIX_LADDER_RUNG_STEP", 10))
+# posture entirely — see VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md v2.0) ────
+# Entry rungs are percentile-of-trailing-10y-VIX-distribution, not fixed VIX
+# levels (see monitor/vix_percentile.py) -- 99th is the top rung and IS the
+# tail-guard ceiling outright, no separate MAX_ARM_LEVEL constant.
+VIX_PERCENTILE_RUNGS = [90, 92.5, 95, 97.5, 99]
+VIX_PERCENTILE_LOOKBACK_YEARS = int(os.getenv("VIX_PERCENTILE_LOOKBACK_YEARS", 10))
+# How often the FRED-derived threshold table is allowed to refresh. Weekly,
+# not daily: at a 10y window one day's close moves the boundary negligibly
+# (see spec §2) -- this is a floor on refresh frequency, not a schedule.
+VIX_PERCENTILE_REFRESH_INTERVAL_DAYS = int(os.getenv("VIX_PERCENTILE_REFRESH_INTERVAL_DAYS", 7))
+# Cache older than this blocks arming NEW campaigns (two missed weekly
+# refreshes); an already-open campaign keeps running on the stale table
+# rather than being force-flattened.
+VIX_PERCENTILE_STALE_DAYS = int(os.getenv("VIX_PERCENTILE_STALE_DAYS", 14))
+
 VIX_LADDER_RUNG_DOLLARS = float(os.getenv("VIX_LADDER_RUNG_DOLLARS", 5000))
 VIX_LADDER_BUDGET_PCT = float(os.getenv("VIX_LADDER_BUDGET_PCT", 0.15))
 VIX_LADDER_PULLBACK_PCT = float(os.getenv("VIX_LADDER_PULLBACK_PCT", 0.03))

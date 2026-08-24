@@ -1,117 +1,132 @@
-# SVIX Ladder Strategy — Requirements v1.0
+# SVIX Ladder Strategy — Requirements v2.0
 
-Final, fully-specified requirements after multi-turn design review (2026-08-20).
-Supersedes the SVIX-related portions of the original SRS v1.4 posture engine.
-This document is the source of truth for implementation — see
-`VIX_OPERATIONS_GUIDE.md` for the resulting operator-facing behavior once built,
-and `SKILL.md`'s VIX Trader section for build history/lessons.
+Final, fully-specified requirements after multi-turn design review (2026-08-24).
+Supersedes v1.0 of this document (2026-08-20, dollar-level ladder) and the
+`VIX_LADDER_MAX_ARM_LEVEL=70` tail-guard ceiling added 2026-08-22. This
+document is the source of truth for implementation — see
+`VIX_OPERATIONS_GUIDE.md` for the resulting operator-facing behavior once
+built, and `SKILL.md`'s VIX Trader section for build history/lessons.
 
 ## 1. What this replaces
 
-Retires, completely, for SVIX specifically:
-- `SVIX_ON` posture (calm-market contango buy, VIX<25) — `monitor/vix_regime.py`
-- `FLATTEN_SVIX` posture *as it applies to SVIX* (VIX≥25 or backwardation exit)
-- `monitor/vix_kill_switch.py` (the -15% SVIX P&L auto kill switch) — deleted
-  entirely, module and all references, since sized/budgeted DCA replaces a
-  P&L-based stop as the risk control.
+Retires the **dollar-level ladder** entirely:
+- Fixed VIX rungs 30/40/50/60/70 (`VIX_LADDER_ARM_LEVEL`,
+  `VIX_LADDER_RUNG_STEP`) — replaced by percentile-derived rungs (§3).
+- `VIX_LADDER_MAX_ARM_LEVEL=70` hard ceiling — replaced outright by the top
+  percentile rung (99th, §3). No separate ceiling constant; the same
+  resume-on-the-way-down semantics the old ceiling had now fall out of the
+  99th rung being the last one in the list.
 
-Unchanged, independent of this strategy:
-- `FADE_SPIKE_PUTS` and `LONG_VOL_TACTICAL` postures (UVXY/VXX options) —
-  these trade options, not SVIX shares, and keep operating as-is.
-- The manual "Flatten SVIX now" dashboard button — still the human override
-  for anything unforeseen. No changes needed: it already sells whatever
-  quantity the broker reports for SVIX, regardless of the ladder's internal
-  lot-tracking.
-- The global manual `VIX_KILL_SWITCH` env flag (operator override, unrelated
-  to the P&L-based auto switch being removed).
+Unchanged, carried forward from v1.0 without modification:
+- Budget sizing: $5,000/rung, 15%-of-NAV live budget cap (§4).
+- Peak/pullback signal, buy/sell conditions, re-arm-on-new-high whipsaw
+  handling, take-profit ladder, position tracking, and state persistence
+  (§5–§9 below) — all still expressed in raw VIX-percent terms, not
+  percentile terms. See §6 for why.
+- Everything in v1.0 §1 ("What this replaces" re: `SVIX_ON`/`FLATTEN_SVIX`/
+  `vix_kill_switch.py`) and the untouched-systems list (options postures,
+  manual "Flatten SVIX now" button, manual `VIX_KILL_SWITCH`).
 
-## 2. Trigger
+## 2. Percentile threshold source
 
-No SVIX activity while VIX ≤ 30. The ladder campaign **arms** the instant a
-cycle observes VIX > 30.
+- **Data:** FRED `VIXCLS` daily series (VIX index close), fetched fresh in
+  full on each recompute — no incremental merge/gap-handling needed, the
+  10-year pull is cheap.
+- **Lookback:** trailing 10 years, spans both the 2008 and 2020 vol regimes
+  by design.
+- **Recompute cadence: weekly**, as part of the existing `vix.daily` Monday
+  run (first trading day of the week). Chosen over daily because at a
+  10-year window a single day's close moves the percentile boundary
+  negligibly — the boundary only meaningfully shifts when an old extreme
+  (e.g. a 2008 or 2020 print) ages out past the 10-year-ago cutoff, which is
+  calendar-driven, not reactive to current-week vol. Weekly captures
+  essentially the same information as daily at a fifth of the external-call
+  surface, and keeps the rung table stable for legible week-over-week log
+  comparison.
+- **Formula:** for each target percentile *p*, find the VIX close level *L*
+  such that the fraction of days in the trailing-10y series with close < L
+  equals *p*. This produces a static table of five VIX-level thresholds
+  (one per rung, §3), refreshed weekly. The live per-cycle comparison in
+  `vix_ladder.py` then stays architecturally identical to v1.0: compare
+  `vix_now` (still sourced from `uw.vix_term()`, unchanged) against a rung
+  *level* — the level is just read from the weekly-refreshed table instead
+  of a hardcoded constant.
+- **Staleness guard:** if the weekly refresh fails (FRED unreachable, empty
+  response, etc.), reuse the last cached threshold table and log a warning
+  rather than blocking evaluation. If the cache is more than 14 days stale
+  (two missed refreshes), refuse to arm new campaigns until a refresh
+  succeeds — existing open campaigns continue operating on the stale table
+  rather than being force-flattened.
+- **New state artifact:** `data/vix/vix_percentile_state.json` — refresh
+  timestamp, the five percentile→VIX-level thresholds, and the lookback
+  window's start/end dates (for audit/debugging).
 
-## 3. Budget
+## 3. Entry ladder (scale-in) — percentile rungs
 
-Campaign budget = **15% of NAV, evaluated live every cycle** — not locked
-once at arm time. Available room for new buys = `0.15 * NAV - (cost basis of
-SVIX shares currently held)`. This live, current-holdings-based definition
-is required for the re-arm mechanism (§7) to work: selling shares via
-take-profit frees up budget for new rungs on a later leg up.
+- Five rungs, at the 90th / 92.5th / 95th / 97.5th / 99th percentile of the
+  trailing-10y VIX close distribution (§2), each resolved weekly to a
+  concrete VIX level.
+- $5,000 tranche per rung (unchanged from v1.0 §4), same residual-sizing
+  behavior when a full tranche would exceed available budget.
+- A rung fires the instant a cycle observes VIX ≥ that rung's *current*
+  resolved level — no close-confirmation required (unchanged mechanic).
+- **99th is the ceiling.** No rung exists above it; a VIX print at or beyond
+  the 99th-percentile level buys (at most) the 99th rung and stops — same
+  behavior the old `VIX_LADDER_MAX_ARM_LEVEL=70` cap produced, now implicit
+  in the rung list itself rather than a separate constant. A literal
+  10-year-record close (100th percentile by construction — no prior day in
+  the window closed higher) is **not** given its own rung: it's already
+  covered by "top 1% of days in a decade," and the ceiling's purpose (stop
+  escalating risk at the extreme, not keep adding size as things get more
+  extreme) argues against a discrete tier above 99th.
+- A given rung fires at most once per continuous campaign (unchanged, same
+  persisted rung-history tracking as v1.0 §4/§9).
 
-## 4. Entry ladder (scale-in)
+## 4. Budget
 
-- Fixed $5,000 tranches at VIX rungs 30, 40, 50, 60, 70, 80... continuing
-  indefinitely (no max rung), bounded only by the budget in §3.
-- A rung fires **the instant a cycle observes VIX ≥ that level** — no
-  close-confirmation required.
-- If the next full $5,000 tranche would exceed available budget, size that
-  final tranche to the exact residual instead, then stop scaling (until
-  budget frees up again per §7).
-- A given rung level fires at most once per continuous campaign (no
-  re-buying the same rung on a whipsaw back through it) — tracked via
-  persisted rung history (§9).
+Unchanged from v1.0 §3: 15% of NAV, evaluated live every cycle. Available
+room for new buys = `0.15 * NAV - (cost basis of SVIX shares currently
+held)`.
 
-## 5. Peak / pullback signal
+## 5. Arm trigger
 
-Track `campaign_peak_vix` = highest VIX observed since the campaign armed
-(monotonically non-decreasing while the campaign is open).
+No SVIX activity while VIX is below the 90th-percentile threshold (§2/§3).
+The campaign **arms** the instant a cycle observes VIX ≥ that threshold —
+same instant-arm mechanic as v1.0 §2, just keyed to the percentile-derived
+level instead of the fixed VIX 30.
 
-**Pulled back** state = current VIX is ≥3% below `campaign_peak_vix`. This
-single signal drives both halves of §6 below — there is no separate hold
-phase between "stop buying" and "start selling."
+## 6. Peak / pullback signal, buy/sell conditions, re-arm, take-profit — unchanged
 
-## 6. Buy/sell conditions (evaluated fresh every cycle — not a one-shot pipeline)
+Kept in **raw VIX-percent terms**, not percentile terms, by explicit
+decision: the pullback trigger and P&L take-profit ladder are driven by
+VIX's *change from campaign peak* and the position's own P&L, not by
+absolute VIX level or where VIX sits in the historical distribution —
+switching the entry side to percentile doesn't require touching either.
 
-- **Buy** a rung when: VIX ≥ the next unbought rung level, AND *not*
-  currently in the pulled-back state, AND budget available (§3).
-- **Sell** the next take-profit chunk when: currently in the pulled-back
-  state, AND there's an unclaimed step at the current P&L level (§8).
+One known consequence, not a defect: percentile rungs are not evenly
+spaced in VIX points (the tail is fat — 90th→92.5th may be a couple of
+points while 97.5th→99th can be much wider), unlike the old evenly-spaced
+30/40/50/60/70 ladder. A fixed 3%-of-peak pullback therefore no longer has
+a consistent relationship to "how many rungs back did we retreat" across a
+campaign — it may cross several rung boundaries near the lower rungs and
+none near the upper ones. This doesn't change any exit logic; it just means
+rung count and pullback magnitude aren't as visually correlated as before.
 
-Because both conditions re-evaluate every cycle against a live budget and a
-monotonic `campaign_peak_vix`, the campaign can move between buying and
-selling phases multiple times within one continuous episode — this is the
-deliberate fix for the whipsaw case (§7).
+All of v1.0 §5–§9 carry forward verbatim:
+- §5 Peak/pullback signal (`campaign_peak_vix`, 3%-below-peak = pulled back)
+- §6 Buy/sell conditions (evaluated fresh every cycle)
+- §7 Re-arm on a new high (whipsaw handling), `campaign_peak_shares`
+- §8 Take-profit ladder (25% of `campaign_peak_shares` per +25/50/75/100pp
+  P&L step, blended cost basis, restart-on-re-arm)
+- §9 Position tracking (FIFO lots, blended cost basis for P&L thresholds)
 
-## 7. Re-arm on a new high (whipsaw handling)
+## 7. State persistence
 
-If, after some take-profit selling has occurred, VIX pushes to a **new**
-campaign high (exceeding the previous `campaign_peak_vix`) and crosses the
-next unbought rung, buying resumes automatically per §6 — using budget freed
-up by the earlier sells. The campaign does not need to go flat and
-re-arm from scratch to participate in a second leg up.
+`monitor/vix_ladder.py` + `data/vix/svix_ladder_state.json` — unchanged
+from v1.0 §10 (campaign armed/idle, peak tracking, rung history, take-profit
+steps, pulled-back state, full reset only when held shares reach zero).
 
-Track `campaign_peak_shares` = highest cumulative SVIX share count ever
-held in this campaign (a running high-water mark; increases only when new
-rungs are bought, never decreases on its own).
-
-## 8. Take-profit ladder
-
-- While in the pulled-back state (§5): sell **25% of `campaign_peak_shares`**
-  (non-compounding — four equal chunks summing to exactly 100% of that
-  high-water mark) at each of four position P&L thresholds: +25%, +50%,
-  +75%, +100%, evaluated against the blended (weighted-average) cost basis
-  of currently-held shares.
-- **Restart on re-arm:** if new rungs are bought after some take-profit
-  steps have already fired (§7), the step counter resets to 0-of-4 and all
-  four future chunks are recomputed as 25% of the *new*, larger
-  `campaign_peak_shares` — not a continuation of the old percentage base.
-  Shares already sold stay sold; this only governs steps not yet taken.
-
-## 9. Position tracking
-
-Per-rung (FIFO lot) records: timestamp, VIX level at purchase, price,
-quantity. Used for accurate cost-basis accounting and an audit trail (same
-FIFO convention already used elsewhere in this codebase, e.g.
-`vix_ledger.fifo_realized_pnl()`). The take-profit P&L thresholds themselves
-are evaluated against the blended/weighted-average cost of current holdings,
-not per-lot independently.
-
-## 10. State persistence
-
-New module (`monitor/vix_ladder.py`) + new state file
-(`data/vix/svix_ladder_state.json`), checked/updated every cycle in both
-`loop_daily_vix.py` and `loop_intraday_vix.py`. Tracks: campaign
-armed/idle, `campaign_peak_vix`, `campaign_peak_shares`, rung purchase
-history, take-profit steps completed (0-4, resets per §8), current
-pulled-back/not state. Full reset to idle only when held shares reach
-zero — the next campaign arms fresh only on a new VIX≤30 → VIX>30 crossing.
+New, in addition: the percentile-threshold refresh (§2) is a separate,
+independently-cached concern (`data/vix/vix_percentile_state.json`) — it
+does not reset with the campaign and persists across arm/idle cycles, since
+it describes the historical distribution, not campaign state.

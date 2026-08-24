@@ -20,26 +20,45 @@ persisted in `data/vix/svix_ladder_state.json`, replacing the old
 `SVIX_ON`/`FLATTEN_SVIX` calm-market posture entirely. Full spec:
 `VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md`.
 
-### Entry (scale-in)
-- No SVIX activity while VIX ≤ `VIX_LADDER_ARM_LEVEL` (30). The instant a
-  cycle observes VIX > 30, the campaign **arms**.
-- Buys $`VIX_LADDER_RUNG_DOLLARS` (5,000) at each VIX rung — 30, 40, 50,
-  60, ... — the instant that level is observed (no close-confirmation
-  needed), continuing until the next full rung would exceed the campaign's
-  budget (`VIX_LADDER_BUDGET_PCT`, 15% of NAV, evaluated live against
-  currently-held cost basis), at which point the final tranche is sized to
-  the exact residual.
-- Each rung level fires **at most once** per campaign — no re-buying the
-  same rung on a whipsaw retest.
-- **Tail-guard ceiling:** rungs above `VIX_LADDER_MAX_ARM_LEVEL` (70) are
-  never bought — a VIX blowout into crisis territory (70+) stops adding new
-  risk, so max buying is the rungs 30/40/50/60/70 ($25k at the default rung
-  size, still bounded by the 15%-of-NAV budget). The ceiling caps the rung
-  *level*, it is **not** a one-way latch: if VIX later rounds back down under
-  70 while still in the buying regime, any skipped lower rungs become
-  eligible again (resume-on-the-way-down). Existing holdings, peak tracking,
-  and take-profit are unaffected — the ceiling only blocks *new* rungs above
-  it.
+### Entry (scale-in) — percentile rungs (v2.0, 2026-08-24)
+- Rungs are **percentiles of the trailing-10-year VIX close distribution**
+  (`config.VIX_PERCENTILE_RUNGS`: 90th / 92.5th / 95th / 97.5th / 99th), not
+  fixed VIX levels. `monitor/vix_percentile.py` converts that distribution
+  into a concrete VIX-level threshold per rung, sourced from FRED's free
+  `VIXCLS` series (NOT Unusual Whales' `iv_rank`, which is the IV rank of
+  VIX's own *options* — a different instrument, and only ~2 years deep).
+- **Refreshed weekly**, inside `loop_daily_vix.py`'s morning batch
+  (`vix_percentile.refresh()` — idempotent, no-ops unless 7+ days have
+  passed since the last successful fetch). If a weekly fetch fails, the
+  last cached table keeps being used and a warning is logged; if the cache
+  goes >`VIX_PERCENTILE_STALE_DAYS` (14) without a successful refresh, the
+  ladder refuses to **arm a new campaign** (an already-open campaign keeps
+  running on the stale table rather than being force-flattened).
+- No SVIX activity while VIX is below the 90th-percentile threshold. The
+  instant a cycle observes VIX above it, the campaign **arms**. As of
+  2026-08-24's live 10-year pull, that's ≈VIX 27 — noticeably below the old
+  fixed VIX 30 arm level, since the trailing distribution (which includes
+  a long 2023-2025 low-vol stretch) skews lower than the old round-number
+  choice.
+- Buys $`VIX_LADDER_RUNG_DOLLARS` (5,000) at each rung's threshold VIX
+  level, the instant it's observed (no close-confirmation needed),
+  continuing until the next full rung would exceed the campaign's budget
+  (`VIX_LADDER_BUDGET_PCT`, 15% of NAV, evaluated live against currently-
+  held cost basis), at which point the final tranche is sized to the exact
+  residual.
+- Each rung fires **at most once** per campaign, tracked by **percentile
+  identity**, not VIX level — the level equivalent to a given percentile
+  drifts slightly week to week as the threshold table refreshes, so
+  "bought" has to key off the rung's identity (e.g. "the 95th"), not
+  whatever raw VIX number that happened to resolve to at the time.
+- **99th percentile is the top rung and the tail-guard ceiling outright** —
+  there's no rung above it and no separate ceiling constant (this replaces
+  v1.0's `VIX_LADDER_MAX_ARM_LEVEL=70`). A literal 10-year-record VIX close
+  (100th percentile by construction) still only buys the 99th rung, same
+  reasoning as the old ceiling: stop escalating risk at the extreme rather
+  than adding a tier for the most-extreme case. Not a one-way latch: if VIX
+  rounds back down while still in the buying regime, any skipped lower
+  rungs become eligible again (resume-on-the-way-down).
 - **No re-entry lock / one-per-day cap applies** — the ladder can buy
   several rungs in a single day if VIX rips through multiple levels; its
   own rung history is what prevents duplicates, not the generic per-day
@@ -67,7 +86,8 @@ persisted in `data/vix/svix_ladder_state.json`, replacing the old
   (the re-arm case above), the step counter **restarts at 0/4**, now
   measured against the new, larger peak share count.
 - Full reset to idle only when held shares reach zero — the next campaign
-  only arms on a fresh VIX≤30→VIX>30 crossing. Also self-heals: if real
+  only arms on a fresh below-90th-percentile→above-90th-percentile
+  crossing. Also self-heals: if real
   positions ever show zero SVIX while the campaign thinks otherwise (e.g.
   a manual flatten), it resets to idle automatically next cycle.
 
@@ -187,7 +207,7 @@ since there's no usable broker client to submit through.
 
 | LaunchAgent | Fires | Behavior |
 |---|---|---|
-| `com.tvclaude.vix.daily` | 9:00 AM ET, weekdays | One batch cycle: session → regime → decide → execute → paper ledger → SKILL.md lesson → dashboard cache → Drive upload |
+| `com.tvclaude.vix.daily` | 9:00 AM ET, weekdays | One batch cycle: session → regime → SVIX percentile-threshold refresh (weekly-gated, see §1) → decide → execute → paper ledger → SKILL.md lesson → dashboard cache → Drive upload |
 | `com.tvclaude.vix.intraday` | 9:30 AM ET, weekdays | Long-running worker; waits until 9:35 ET (RTH start), then runs a cycle every `VIX_LOOP_SECONDS` (900s / 15 min) until 15:55 ET, then exits |
 
 Manual trigger (bypasses schedule, runs a real cycle right now):
