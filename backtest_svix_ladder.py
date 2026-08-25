@@ -236,6 +236,82 @@ def summarize(result: dict) -> None:
     }
 
 
+def _live_nav() -> float | None:
+    """Real Alpaca paper account buying power, if the session is reachable
+    right now -- used to ground the structural stress test in the actual
+    current account size rather than only illustrative round numbers."""
+    try:
+        from monitor import vix_session
+        session = vix_session.assess()
+        return session.buying_power
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def stress_test_max_exposure(nav_levels: list[float] | None = None) -> None:
+    """
+    Structural stress test — NOT tied to backtest history (the actual
+    historical window never loaded past 8% of NAV, so it can't speak to
+    the strategy's true worst case). Computes the ladder's real maximum
+    dollar exposure and applies a range of single-day shock magnitudes to
+    it, at a few illustrative NAV levels.
+
+    Key structural fact this surfaces: max exposure is
+    min(VIX_LADDER_BUDGET_PCT * NAV, rungs * VIX_LADDER_RUNG_DOLLARS) --
+    NOT always 15% of NAV. VIX_LADDER_RUNG_DOLLARS is a flat $5,000/rung,
+    not a %-of-NAV, so for any account above the crossover NAV
+    (rungs*$5,000 / 15%), the fixed rung total is what actually binds, and
+    it SHRINKS as a fraction of NAV as the account grows. The live paper
+    account (~$394k as of 2026-08-26) is well above that crossover.
+
+    On the instrument itself: SVIX is a '40 Act ETF (holds VIX futures
+    directly, daily-reset to a -1x index), not an ETN like XIV was. XIV's
+    ~96% overnight loss in Feb 2018 came partly from its ETN structure's
+    "Acceleration Event" clause, letting the issuer (Credit Suisse) force
+    early redemption at a fraction of prior value -- a mechanism specific
+    to ETNs (unsecured issuer debt), which SVIX's prospectus does not
+    appear to carry (confirmed via SEC/Volatility Shares filings,
+    2026-08-26). SVIX can't be "terminated" by an issuer the way XIV was.
+    It remains fully exposed, as a -1x fund, to the same underlying
+    short-vol-futures violence that caused XIV/SVXY's Feb 2018 collapse in
+    the first place -- the structural analogy for "how bad can one day
+    get" still holds even though the specific ETN-termination mechanism
+    does not apply.
+    """
+    max_dollar_exposure = config.VIX_LADDER_RUNG_DOLLARS * len(config.VIX_PERCENTILE_RUNGS)
+    crossover_nav = max_dollar_exposure / config.VIX_LADDER_BUDGET_PCT
+
+    live_nav = _live_nav()
+    if nav_levels is None:
+        nav_levels = [100_000.0, crossover_nav, 250_000.0]
+        if live_nav:
+            nav_levels.append(live_nav)
+
+    print("\n" + "=" * 78)
+    print("  STRUCTURAL STRESS TEST — single-day short-vol shock at max exposure")
+    print("=" * 78)
+    print(f"  Max dollar exposure = min({config.VIX_LADDER_BUDGET_PCT:.0%} of NAV, "
+          f"{len(config.VIX_PERCENTILE_RUNGS)} rungs x ${config.VIX_LADDER_RUNG_DOLLARS:,.0f}) "
+          f"= min({config.VIX_LADDER_BUDGET_PCT:.0%} of NAV, ${max_dollar_exposure:,.0f})")
+    print(f"  Crossover NAV (both caps equal): ${crossover_nav:,.0f} -- above this, the flat "
+          f"${max_dollar_exposure:,.0f} rung total binds, NOT the 15%-of-NAV figure, since rung size "
+          f"doesn't scale with account size.")
+
+    shocks = [0.50, 0.70, 0.90, 0.96, 1.00]
+    for nav in sorted(set(nav_levels)):
+        budget_cap = config.VIX_LADDER_BUDGET_PCT * nav
+        actual_exposure = min(budget_cap, max_dollar_exposure)
+        binding = "5-rung total (fixed $)" if actual_exposure < budget_cap else "15%-of-NAV budget"
+        tag = " <- current live paper account" if live_nav and abs(nav - live_nav) < 1 else ""
+        print(f"\n  NAV=${nav:,.0f}{tag}  |  binding constraint: {binding}  |  "
+              f"max exposure=${actual_exposure:,.0f} ({actual_exposure / nav:.1%} of NAV)")
+        for shock in shocks:
+            loss = actual_exposure * shock
+            label = "XIV's actual Feb-2018 loss" if shock == 0.96 else ("total loss" if shock == 1.00 else "")
+            print(f"    -{shock:.0%} single-day move {f'({label})' if label else '':<28} -> "
+                  f"-${loss:,.2f}  ({loss / nav:.1%} of NAV)")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Backtest the SVIX percentile ladder")
     parser.add_argument("--nav", type=float, default=250_000.0, help="Fixed NAV for budget-cap sizing (default: 250000)")
@@ -243,3 +319,4 @@ if __name__ == "__main__":
 
     result = run_backtest(args.nav)
     stats = summarize(result)
+    stress_test_max_exposure()

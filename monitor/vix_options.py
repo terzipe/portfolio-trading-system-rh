@@ -193,7 +193,20 @@ def pick_put(spot_price: float, primary_ticker: str = "UVXY", fallback_ticker: s
 
 
 def pick_call(ticker: str = "VXX", delta_range: tuple[float, float] = (0.40, 0.60)) -> ContractPick | None:
-    """21-45 DTE, delta 0.40-0.60 (SRS §7.6, Aug-Oct tactical long-vol)."""
+    """21-45 DTE, delta 0.40-0.60 (SRS §7.6, Aug-Oct tactical long-vol).
+
+    Liquidity-filtered via _is_liquid() the same way pick_put() is —
+    previously picked purely on delta proximity with no liquidity check at
+    all, an inconsistency with pick_put()'s spread/OI check (found during
+    design review, fixed 2026-08-26; vix_executor.py's skip_reason for a
+    None return already said "no liquid ... call found", so this was
+    always the intended behavior, just never implemented). Unlike
+    pick_put(), there's no second ticker to fall back to (VXX is the only
+    ticker LONG_VOL_TACTICAL trades) — instead of falling back to a
+    different underlying, this walks the delta-sorted pool and returns the
+    first candidate that clears the liquidity bar, only refusing (None) if
+    nothing in the pool does.
+    """
     uw = get_client()
     try:
         chain = uw.option_chain(ticker, greeks=True)
@@ -209,7 +222,9 @@ def pick_call(ticker: str = "VXX", delta_range: tuple[float, float] = (0.40, 0.6
 
     mid_target = (lo + hi) / 2
     pool.sort(key=lambda c: abs((_optional_float(c.get("delta")) or mid_target) - mid_target))
-    best = pool[0]
+    best = next((c for c in pool if _is_liquid(c)), None)
+    if best is None:
+        return None
     bid, ask = _safe_float(best.get("nbbo_bid")), _safe_float(best.get("nbbo_ask"))
     return ContractPick(
         ticker=ticker, option_type="call",

@@ -5,6 +5,7 @@ blocked ROLL_OPTION/CLOSE_OPTION from ever firing and kept unrealized P&L
 scoped to shares only.
 """
 import json
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ import pytest
 from monitor import vix_options
 
 _FIXTURE = Path(__file__).parent / "fixtures" / "uw" / "uvxy_chain.json"
+_MID_DTE_EXPIRY = (date.today() + timedelta(days=30)).isoformat()  # within VIX_CALL_MIN/MAX_DTE (21-45)
 
 
 class _FakeUW:
@@ -141,3 +143,65 @@ def test_get_contract_mark_against_real_captured_chain():
         vo.get_client = original_get_client
 
     assert mark == pytest.approx(3.70)  # (3.30 + 4.10) / 2, from the captured fixture row
+
+
+# ── pick_call() liquidity filtering (fixed 2026-08-26 — previously picked
+# purely on delta proximity with no liquidity check at all) ────────────
+
+def _call(strike, delta, bid, ask, oi=200):
+    return {
+        "expires": _MID_DTE_EXPIRY, "option_type": "call", "strike": str(strike),
+        "delta": str(delta), "nbbo_bid": str(bid), "nbbo_ask": str(ask), "open_interest": oi,
+    }
+
+
+def test_pick_call_returns_the_best_delta_match_when_liquid(monkeypatch):
+    chain = {"data": [
+        _call(strike=20, delta=0.50, bid=1.00, ask=1.02, oi=500),  # mid_target=0.50, exact match, liquid
+        _call(strike=25, delta=0.30, bid=1.00, ask=1.02, oi=500),  # off-target
+    ]}
+    monkeypatch.setattr(vix_options, "get_client", lambda: _FakeUW(chain))
+
+    pick = vix_options.pick_call("VXX")
+    assert pick is not None
+    assert pick.strike == 20.0
+
+
+def test_pick_call_skips_an_illiquid_best_match_for_the_next_liquid_one(monkeypatch):
+    chain = {"data": [
+        # Best delta match (0.50, dead center) but a wide 20% spread -- illiquid.
+        _call(strike=20, delta=0.50, bid=1.00, ask=1.20, oi=500),
+        # Second-best delta match (0.45), tight spread and healthy OI -- liquid.
+        _call(strike=22, delta=0.45, bid=1.00, ask=1.02, oi=500),
+    ]}
+    monkeypatch.setattr(vix_options, "get_client", lambda: _FakeUW(chain))
+
+    pick = vix_options.pick_call("VXX")
+    assert pick is not None
+    assert pick.strike == 22.0  # skipped the illiquid top pick
+
+
+def test_pick_call_none_when_nothing_in_the_pool_is_liquid(monkeypatch):
+    chain = {"data": [
+        _call(strike=20, delta=0.50, bid=1.00, ask=1.20, oi=500),   # wide spread
+        _call(strike=22, delta=0.45, bid=1.00, ask=1.02, oi=10),    # thin OI
+    ]}
+    monkeypatch.setattr(vix_options, "get_client", lambda: _FakeUW(chain))
+
+    assert vix_options.pick_call("VXX") is None
+
+
+def test_pick_call_thin_open_interest_alone_is_illiquid(monkeypatch):
+    chain = {"data": [_call(strike=20, delta=0.50, bid=1.00, ask=1.02, oi=10)]}  # tight spread, oi<50
+    monkeypatch.setattr(vix_options, "get_client", lambda: _FakeUW(chain))
+
+    assert vix_options.pick_call("VXX") is None
+
+
+def test_pick_call_none_when_chain_fetch_fails(monkeypatch):
+    class _FailingUW:
+        def option_chain(self, ticker, greeks=True):
+            raise vix_options.UWError("boom")
+
+    monkeypatch.setattr(vix_options, "get_client", lambda: _FailingUW())
+    assert vix_options.pick_call("VXX") is None

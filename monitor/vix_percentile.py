@@ -106,6 +106,22 @@ def is_stale(state: dict | None = None) -> bool:
     return age is None or age >= VIX_PERCENTILE_STALE_DAYS
 
 
+def staleness_status() -> dict:
+    """Read-only summary for alerting/dashboard consumers (loop_daily_vix.py,
+    regime_trader's dashboard) — never refreshes anything itself. is_stale
+    here means "too old to arm a NEW campaign" (VIX_PERCENTILE_STALE_DAYS,
+    default 14d / two missed weekly refreshes); an already-open campaign
+    keeps running regardless (see vix_ladder.evaluate())."""
+    state = _load_state()
+    age = _days_since(state["refreshed_at"])
+    return {
+        "is_stale": is_stale(state),
+        "refreshed_at": state["refreshed_at"],
+        "age_days": round(age, 1) if age is not None else None,
+        "stale_threshold_days": VIX_PERCENTILE_STALE_DAYS,
+    }
+
+
 def refresh(force: bool = False) -> dict:
     """Refresh the cached threshold table from FRED if due (or forced).
     Safe to call every weekday — no-ops on days it isn't due. On fetch

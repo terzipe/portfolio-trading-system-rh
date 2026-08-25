@@ -137,3 +137,57 @@ def unrealized_pnl(positions: list[dict]) -> dict:
         "total_pct": (total_dollars / total_cost) if total_cost else None,
         "by_ticker": by_ticker,
     }
+
+
+def net_vol_exposure(positions: list[dict]) -> dict:
+    """
+    Net directional vol exposure across the SVIX ladder (short vol) and the
+    options sleeve — visibility only, not an enforced limit. The two
+    sleeves size against independent budgets with no shared risk view; this
+    is a dashboard/reporting calc confirmed as wanted 2026-08-26, not a new
+    sizing constraint on either sleeve.
+
+    Direction, and a correction worth being explicit about: UVXY/VXX PUTS
+    (FADE_SPIKE_PUTS) are a SHORT-vol bet — they profit when UVXY/VXX fall,
+    i.e. when vol falls, the same direction as the SVIX ladder, not a
+    hedge against it. Only UVXY/VXX CALLS (LONG_VOL_TACTICAL) are the
+    natural offset. "the options sleeve is long vol" is only true for the
+    LONG_VOL_TACTICAL half of it — the fade-spike half stacks with SVIX,
+    it doesn't net against it.
+
+    Uses raw dollar market value (mid_price, falling back to cost_basis if
+    no live mark yet) as the exposure unit, matching every other sizing
+    calc in this codebase (e.g. vix_executor._sleeve_pct_ok's sleeve_mv) —
+    NOT a delta/beta-weighted Greek exposure. $1 of SVIX and $1 of VXX call
+    premium do not move 1:1 with the same VIX change (options carry
+    leverage/convexity that SVIX's -1x linear exposure doesn't); read
+    net_dollars as a notional proxy, not a hedged Greek net.
+    """
+    short_vol_dollars = 0.0
+    long_vol_dollars = 0.0
+    legs = {"svix_ladder": 0.0, "puts": 0.0, "calls": 0.0}
+
+    for p in positions:
+        mark = p.get("mid_price")
+        if p.get("type") == "share" and p.get("ticker") == "SVIX":
+            qty = p.get("quantity") or 0
+            value = qty * (mark if mark is not None else p.get("cost_basis", 0))
+            short_vol_dollars += value
+            legs["svix_ladder"] += value
+        elif p.get("type") == "option" and p.get("ticker") in ("UVXY", "VXX"):
+            contracts = p.get("contracts") or 0
+            value = contracts * (mark if mark is not None else p.get("cost_basis", 0))
+            if p.get("option_type") == "put":
+                short_vol_dollars += value
+                legs["puts"] += value
+            elif p.get("option_type") == "call":
+                long_vol_dollars += value
+                legs["calls"] += value
+
+    return {
+        "long_vol_dollars": long_vol_dollars,
+        "short_vol_dollars": short_vol_dollars,
+        "net_dollars": long_vol_dollars - short_vol_dollars,
+        "gross_dollars": long_vol_dollars + short_vol_dollars,
+        "legs": legs,
+    }

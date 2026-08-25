@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 from alpaca.trading.enums import AssetClass
 
-from monitor.vix_positions import unrealized_pnl, fetch_positions, _parse_occ_symbol
+from monitor.vix_positions import unrealized_pnl, net_vol_exposure, fetch_positions, _parse_occ_symbol
 
 
 def test_unrealized_pnl_shares_only():
@@ -58,6 +58,75 @@ def test_unrealized_pnl_mixed_shares_and_options():
     # shares: (27-26)*10 = 10; options: (100-115)*2 = -30
     assert result["total_dollars"] == -20.0
     assert len(result["by_ticker"]) == 2
+
+
+# ── net_vol_exposure() — SVIX ladder + options sleeve netting ──────────
+
+def test_net_vol_exposure_svix_shares_are_short_vol():
+    positions = [{"ticker": "SVIX", "type": "share", "quantity": 100.0, "cost_basis": 26.0, "mid_price": 27.0}]
+    result = net_vol_exposure(positions)
+    assert result["short_vol_dollars"] == 2700.0  # 100 * 27
+    assert result["long_vol_dollars"] == 0.0
+    assert result["net_dollars"] == -2700.0
+    assert result["legs"]["svix_ladder"] == 2700.0
+
+
+def test_net_vol_exposure_vxx_calls_are_long_vol():
+    positions = [{
+        "ticker": "VXX", "type": "option", "contracts": 5.0, "cost_basis": 100.0,
+        "mid_price": 120.0, "expiry": "2099-01-15", "strike": 20.0, "option_type": "call",
+    }]
+    result = net_vol_exposure(positions)
+    assert result["long_vol_dollars"] == 600.0  # 5 * 120
+    assert result["short_vol_dollars"] == 0.0
+    assert result["net_dollars"] == 600.0
+    assert result["legs"]["calls"] == 600.0
+
+
+def test_net_vol_exposure_uvxy_puts_stack_with_svix_not_hedge_it():
+    # The key correction this function encodes: puts are SHORT vol, same
+    # direction as the SVIX ladder, not a hedge against it.
+    positions = [{
+        "ticker": "UVXY", "type": "option", "contracts": 3.0, "cost_basis": 80.0,
+        "mid_price": 90.0, "expiry": "2099-01-15", "strike": 30.0, "option_type": "put",
+    }]
+    result = net_vol_exposure(positions)
+    assert result["short_vol_dollars"] == 270.0  # 3 * 90
+    assert result["long_vol_dollars"] == 0.0
+    assert result["net_dollars"] == -270.0
+    assert result["legs"]["puts"] == 270.0
+
+
+def test_net_vol_exposure_nets_ladder_against_calls():
+    positions = [
+        {"ticker": "SVIX", "type": "share", "quantity": 100.0, "cost_basis": 26.0, "mid_price": 27.0},  # -2700
+        {
+            "ticker": "VXX", "type": "option", "contracts": 5.0, "cost_basis": 100.0,
+            "mid_price": 120.0, "expiry": "2099-01-15", "strike": 20.0, "option_type": "call",
+        },  # +600
+    ]
+    result = net_vol_exposure(positions)
+    assert result["net_dollars"] == -2100.0  # 600 - 2700
+    assert result["gross_dollars"] == 3300.0  # 600 + 2700
+
+
+def test_net_vol_exposure_falls_back_to_cost_basis_without_a_live_mark():
+    positions = [{"ticker": "SVIX", "type": "share", "quantity": 100.0, "cost_basis": 26.0, "mid_price": None}]
+    result = net_vol_exposure(positions)
+    assert result["short_vol_dollars"] == 2600.0  # 100 * 26 (cost_basis, no mark yet)
+
+
+def test_net_vol_exposure_ignores_unrelated_tickers():
+    positions = [{"ticker": "AAPL", "type": "share", "quantity": 100.0, "cost_basis": 150.0, "mid_price": 155.0}]
+    result = net_vol_exposure(positions)
+    assert result == {"long_vol_dollars": 0.0, "short_vol_dollars": 0.0, "net_dollars": 0.0,
+                       "gross_dollars": 0.0, "legs": {"svix_ladder": 0.0, "puts": 0.0, "calls": 0.0}}
+
+
+def test_net_vol_exposure_empty_positions():
+    result = net_vol_exposure([])
+    assert result["net_dollars"] == 0.0
+    assert result["gross_dollars"] == 0.0
 
 
 # ── OCC symbol parsing (Alpaca migration) ───────────────────────────────

@@ -82,6 +82,33 @@ def test_fifteen_days_old_is_stale():
     assert vix_percentile.is_stale(state) is True
 
 
+# ── staleness_status() — alerting/dashboard summary ─────────────────
+
+def test_staleness_status_never_refreshed(isolated_state):
+    status = vix_percentile.staleness_status()
+    assert status["is_stale"] is True
+    assert status["refreshed_at"] is None
+    assert status["age_days"] is None
+    assert status["stale_threshold_days"] == vix_percentile.VIX_PERCENTILE_STALE_DAYS
+
+
+def test_staleness_status_fresh_refresh(isolated_state, monkeypatch):
+    monkeypatch.setattr(vix_percentile, "fetch_vix_closes", lambda years: [10.0, 20.0, 30.0])
+    vix_percentile.refresh()
+    status = vix_percentile.staleness_status()
+    assert status["is_stale"] is False
+    assert status["refreshed_at"] is not None
+    assert status["age_days"] == pytest.approx(0.0, abs=0.01)
+
+
+def test_staleness_status_reports_age_of_a_stale_cache(isolated_state):
+    stale_ts = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
+    vix_percentile._save_state({"refreshed_at": stale_ts, "thresholds": {"90": 30.0}, "lookback_years": 10, "sample_size": 100})
+    status = vix_percentile.staleness_status()
+    assert status["is_stale"] is True
+    assert status["age_days"] == pytest.approx(20.0, abs=0.01)
+
+
 # ── refresh() ────────────────────────────────────────────────────────
 
 def test_refresh_fetches_and_persists_when_due(isolated_state, monkeypatch):
