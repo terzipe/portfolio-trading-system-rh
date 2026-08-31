@@ -301,6 +301,61 @@ def test_selfheal_does_not_fire_in_dry_run(isolated_state):
     assert vix_ladder.get_status()["armed"] is True
 
 
+# ── exclude_other_campaign_shares() — isolation from svix_manual_campaign,
+# found 2026-08-31 (self-heal was blind whenever the OTHER campaign's SVIX
+# shares kept the account's aggregate position non-zero) ────────────────
+
+def test_exclude_other_campaign_shares_subtracts_from_svix_only():
+    positions = [{"ticker": "SVIX", "type": "share", "quantity": 50}, {"ticker": "UVXY", "type": "option", "quantity": 1}]
+    adjusted = vix_ladder.exclude_other_campaign_shares(positions, other_campaign_qty=30)
+    assert adjusted[0]["quantity"] == 20
+    assert adjusted[1] == {"ticker": "UVXY", "type": "option", "quantity": 1}  # untouched
+
+
+def test_exclude_other_campaign_shares_floors_at_zero():
+    positions = _held(10)
+    adjusted = vix_ladder.exclude_other_campaign_shares(positions, other_campaign_qty=50)
+    assert adjusted[0]["quantity"] == 0
+
+
+def test_exclude_other_campaign_shares_noop_when_other_campaign_flat():
+    positions = _held(50)
+    adjusted = vix_ladder.exclude_other_campaign_shares(positions, other_campaign_qty=0)
+    assert adjusted[0]["quantity"] == 50
+
+
+def test_exclude_other_campaign_shares_does_not_mutate_input():
+    positions = _held(50)
+    vix_ladder.exclude_other_campaign_shares(positions, other_campaign_qty=30)
+    assert positions[0]["quantity"] == 50  # original list/dict untouched
+
+
+def test_selfheal_blind_without_adjustment_when_other_campaign_holds_shares(isolated_state):
+    """Documents the bug found 2026-08-31, not a desired behavior: without
+    exclude_other_campaign_shares(), self-heal can't tell the ladder's own
+    flattened shares from the manual campaign's still-held ones, since both
+    just show up as "the account has SVIX."""
+    vix_ladder.arm_campaign(31.0)
+    vix_ladder.record_rung_bought(90, 30.0, 166, 30.0)
+    # Ladder's own 166 shares got flattened, but the manual campaign still
+    # holds 40 -- real aggregate position is 40, not 0.
+    actions = vix_ladder.evaluate(vix=20.0, nav=100_000, positions=_held(40), live_price=20.0)
+    assert actions == []
+    assert vix_ladder.get_status()["armed"] is True  # BLIND -- did not self-heal
+
+
+def test_selfheal_fires_with_adjustment_when_other_campaign_holds_shares(isolated_state):
+    """Same scenario as the blind test above, but with the fix applied --
+    matches how loop_daily_vix.py/loop_intraday_vix.py now call this."""
+    vix_ladder.arm_campaign(31.0)
+    vix_ladder.record_rung_bought(90, 30.0, 166, 30.0)
+    real_positions = _held(40)  # manual campaign's 40 shares, ladder's own already flattened
+    adjusted = vix_ladder.exclude_other_campaign_shares(real_positions, other_campaign_qty=40)
+    actions = vix_ladder.evaluate(vix=20.0, nav=100_000, positions=adjusted, live_price=20.0)
+    assert actions == []
+    assert vix_ladder.get_status()["armed"] is False  # correctly self-healed
+
+
 # ── Self-heal #2: natural full exit via take-profit must also idle out
 # (found via backtesting 2026-08-25 — a completed campaign was silently
 # staying "armed" forever, corrupting the next campaign's rung history,

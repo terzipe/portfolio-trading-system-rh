@@ -121,6 +121,44 @@ def _held_svix_shares(positions: list[dict]) -> dict | None:
     return None
 
 
+def exclude_other_campaign_shares(positions: list[dict], other_campaign_qty: float) -> list[dict]:
+    """Returns a copy of `positions` with SVIX's quantity reduced by
+    `other_campaign_qty` (floored at 0); non-SVIX entries pass through
+    unchanged.
+
+    Fixes a real isolation gap found 2026-08-31: this module's self-heal
+    (see evaluate()'s two checks below) reads the ACCOUNT'S aggregate real
+    SVIX position via `positions` and assumes it IS the ladder's own
+    position -- true when this module was written, no longer true since
+    monitor/svix_manual_campaign.py started buying SVIX in the same
+    account. Without this adjustment, self-heal goes blind exactly when it
+    matters: if the ladder's own shares get flattened (by the dashboard's
+    "Flatten SVIX now", or a direct Alpaca trade) while the manual campaign
+    concurrently holds shares, the aggregate position stays > 0 (the manual
+    campaign's shares), so self-heal #1 (`held_qty <= 0`) never fires, and
+    the ladder's stale open_lots/armed state persists silently.
+
+    Callers should pass `svix_manual_campaign.get_status()["current_shares"]`
+    as `other_campaign_qty` -- this module deliberately does NOT import that
+    module directly, to keep the two campaigns' modules decoupled; the
+    caller (loop_daily_vix.py / loop_intraday_vix.py) does the subtraction
+    before handing positions to evaluate().
+
+    Known residual limitation: if the manual campaign's own tracked count is
+    itself stale (e.g. a just-filled buy not yet reconciled into its
+    open_lots), `other_campaign_qty` under-counts and the ladder's inferred
+    quantity is briefly over-counted -- a narrow window bounded by that
+    module's own reconcile cadence, not fixed here."""
+    if other_campaign_qty <= 0:
+        return positions
+    adjusted = []
+    for p in positions:
+        if p.get("ticker") == "SVIX" and p.get("type") == "share":
+            p = {**p, "quantity": max(0.0, float(p.get("quantity", 0)) - other_campaign_qty)}
+        adjusted.append(p)
+    return adjusted
+
+
 def _next_unbought_rung(state: dict, vix: float, thresholds: dict[float, float]) -> tuple[float, float] | None:
     """Returns (percentile, vix_level) for the lowest unbought rung whose
     threshold VIX level has been reached, or None. Excludes rungs with a

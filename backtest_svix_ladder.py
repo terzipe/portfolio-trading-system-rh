@@ -72,9 +72,10 @@ def fetch_svix_series() -> pd.Series:
     return close.dropna()
 
 
-def run_backtest(nav: float) -> dict:
+def run_backtest(nav: float, lookback_years: float | None = None) -> dict:
+    lookback_years = lookback_years if lookback_years is not None else config.VIX_PERCENTILE_LOOKBACK_YEARS
     svix = fetch_svix_series()
-    lookback_buffer = timedelta(days=365 * config.VIX_PERCENTILE_LOOKBACK_YEARS + 60)
+    lookback_buffer = timedelta(days=365 * lookback_years + 60)
     vix = fetch_vix_series(svix.index.min().date() - lookback_buffer, date.today())
 
     state_file = SYSTEM_DIR / "data" / "vix" / "_backtest_state.json"
@@ -85,7 +86,7 @@ def run_backtest(nav: float) -> dict:
 
     def _thresholds_for(d: pd.Timestamp) -> dict[float, float]:
         if thresholds_cache["as_of"] is None or (d - thresholds_cache["as_of"]).days >= config.VIX_PERCENTILE_REFRESH_INTERVAL_DAYS:
-            window_start = d - pd.Timedelta(days=365 * config.VIX_PERCENTILE_LOOKBACK_YEARS)
+            window_start = d - pd.Timedelta(days=365 * lookback_years)
             closes = vix[(vix.index > window_start) & (vix.index <= d)].tolist()
             thresholds_cache["table"] = vix_percentile.compute_thresholds(closes)
             thresholds_cache["as_of"] = d
@@ -146,7 +147,7 @@ def run_backtest(nav: float) -> dict:
         })
 
     vix_ladder.reset_campaign()
-    return {"trade_log": trade_log, "daily_marks": daily_marks, "nav": nav, "svix": svix}
+    return {"trade_log": trade_log, "daily_marks": daily_marks, "nav": nav, "svix": svix, "lookback_years": lookback_years}
 
 
 def summarize(result: dict) -> None:
@@ -172,17 +173,32 @@ def summarize(result: dict) -> None:
             open_campaign = None
     still_open = open_campaign is not None
 
+    # Per-campaign realized P&L, attributing each SELL to whichever
+    # completed campaign's [start, end] date range it falls in -- gives a
+    # "win rate" comparable in spirit to the LONG_VOL_TACTICAL gate
+    # backtest's per-signal win rate, even though the ladder is a
+    # continuous state machine, not discrete signals.
+    for c in campaigns:
+        c["realized_pnl"] = sum(
+            t["realized_pnl"] for t in sells if c["start"] <= t["date"] <= c["end"]
+        )
+    campaign_win_rate = (
+        sum(1 for c in campaigns if c["realized_pnl"] > 0) / len(campaigns) if campaigns else None
+    )
+
     print("\n" + "=" * 70)
     print("  SVIX PERCENTILE LADDER — BACKTEST RESULTS")
     print("=" * 70)
     print(f"  Window: {marks[0]['date']} -> {marks[-1]['date']} ({len(marks)} trading days)")
     print(f"  NAV (fixed): ${nav:,.2f} | budget cap: ${config.VIX_LADDER_BUDGET_PCT * nav:,.2f} "
           f"({config.VIX_LADDER_BUDGET_PCT:.0%} of NAV)")
-    print(f"  Rungs: {config.VIX_PERCENTILE_RUNGS} | lookback: {config.VIX_PERCENTILE_LOOKBACK_YEARS}y | "
+    print(f"  Rungs: {config.VIX_PERCENTILE_RUNGS} | lookback: {result['lookback_years']}y | "
           f"refresh: every {config.VIX_PERCENTILE_REFRESH_INTERVAL_DAYS}d")
     print()
     print(f"  Campaigns completed (fully flattened): {len(campaigns)}")
     print(f"  Campaign still open at end of window:  {still_open}")
+    print(f"  Campaign win rate (net-profitable completed campaigns): "
+          f"{campaign_win_rate:.0%}" if campaign_win_rate is not None else "  Campaign win rate: n/a")
     print(f"  Total buys: {len(buys)} (${total_deployed:,.2f} deployed)  Total take-profit sells: {len(sells)}")
     print(f"  Total realized P&L: ${total_realized:,.2f}")
     print()
@@ -233,17 +249,20 @@ def summarize(result: dict) -> None:
         "campaigns": campaigns, "still_open": still_open, "total_realized": total_realized,
         "total_deployed": total_deployed, "peak_cost_basis": peak_cost_basis, "peak_mark": peak_mark,
         "worst_unrealized": worst_unrealized, "worst_real_daily_move": worst_real_daily_move,
+        "campaign_win_rate": campaign_win_rate,
     }
 
 
 def _live_nav() -> float | None:
-    """Real Alpaca paper account buying power, if the session is reachable
+    """Real Alpaca paper account equity/NAV, if the session is reachable
     right now -- used to ground the structural stress test in the actual
-    current account size rather than only illustrative round numbers."""
+    current account size rather than only illustrative round numbers. Was
+    session.buying_power (Reg-T margin capacity, ~4x real equity) until
+    2026-08-31 -- see loop_daily_vix.py's matching fix."""
     try:
         from monitor import vix_session
         session = vix_session.assess()
-        return session.buying_power
+        return session.equity
     except Exception:  # noqa: BLE001
         return None
 

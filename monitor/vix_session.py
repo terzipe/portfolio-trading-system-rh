@@ -42,6 +42,13 @@ class SessionResult:
     last_refresh_at: float | None = None
     account_ok: bool = False
     buying_power: float | None = None
+    # Real account NAV (Alpaca's `equity`/`portfolio_value`, the two are the
+    # same field), added 2026-08-31 -- `buying_power` is Reg-T margin
+    # capacity (confirmed live: exactly 4.00x equity on this paper account),
+    # not net worth, and was being used AS nav for budget-cap sizing
+    # (VIX_LADDER_BUDGET_PCT * nav in vix_ladder.py) before this fix. See
+    # project memory for the full before/after.
+    equity: float | None = None
     client: object = None  # the authenticated Alpaca TradingClient, if HEALTHY/DEGRADED
     checks: dict = field(default_factory=dict)
 
@@ -53,6 +60,7 @@ class SessionResult:
             "last_refresh_at": self.last_refresh_at,
             "account_ok": self.account_ok,
             "buying_power": self.buying_power,
+            "equity": self.equity,
             "checks": self.checks,
             "saved_at": time.time(),
         }
@@ -84,7 +92,13 @@ def _load_shadow_book() -> dict | None:
 
 
 def _save_shadow_book(positions: list[dict]) -> None:
-    """Only ever called after a HEALTHY positions pull (SRS §8.2)."""
+    """Originally "only ever called after a HEALTHY positions pull" (SRS
+    §8.2) -- also called from the BOOK_MISMATCH DEAD path since 2026-08-31
+    (see assess()'s call site for why). `positions` must still come from a
+    structurally-valid positions response (isinstance(..., list) already
+    checked by the caller) -- never call this with data from a failed/
+    erroring positions call, only a successful one that merely conflicted
+    with the old shadow book."""
     payload = {"saved_at": time.time(), "positions": positions}
     VIX_SHADOW_BOOK_FILE.write_text(json.dumps(payload, indent=2))
 
@@ -130,18 +144,20 @@ def assess() -> SessionResult:
     try:
         account = client.get_account()
         buying_power = float(account.buying_power)
+        equity = float(account.equity)
         account_ok = account.status == "ACTIVE" and not account.trading_blocked and not account.account_blocked
         checks["account_ok"] = bool(account_ok)
         checks["buying_power_numeric"] = buying_power == buying_power  # NaN check
+        checks["equity_numeric"] = equity == equity  # NaN check
     except Exception as exc:  # noqa: BLE001
         result = SessionResult(state=DEAD, reason=f"account/equity check failed: {exc}", checks=checks)
         _save_state(result)
         return result
 
-    if not checks["account_ok"] or not checks["buying_power_numeric"]:
+    if not checks["account_ok"] or not checks["buying_power_numeric"] or not checks["equity_numeric"]:
         result = SessionResult(
-            state=DEAD, reason="account_ok or buying_power check failed",
-            buying_power=buying_power, checks=checks,
+            state=DEAD, reason="account_ok or buying_power/equity check failed",
+            buying_power=buying_power, equity=equity, checks=checks,
         )
         _save_state(result)
         return result
@@ -152,7 +168,7 @@ def assess() -> SessionResult:
     except Exception as exc:  # noqa: BLE001
         result = SessionResult(
             state=DEAD, reason=f"positions call failed: {exc}",
-            buying_power=buying_power, checks=checks,
+            buying_power=buying_power, equity=equity, checks=checks,
         )
         _save_state(result)
         return result
@@ -160,7 +176,7 @@ def assess() -> SessionResult:
     if not checks["positions_payload_structured"]:
         result = SessionResult(
             state=DEAD, reason="positions payload not structured (API error, not empty list)",
-            buying_power=buying_power, checks=checks,
+            buying_power=buying_power, equity=equity, checks=checks,
         )
         _save_state(result)
         return result
@@ -171,10 +187,30 @@ def assess() -> SessionResult:
     ]
 
     if not normalized and _shadow_book_has_vol_names():
+        # Refresh the shadow book with this fresh (structurally-valid,
+        # legitimately empty) read even though the overall result is DEAD --
+        # fixed 2026-08-31, real bug hit live. Before this, the shadow book
+        # was only ever updated on HEALTHY, but HEALTHY was exactly what
+        # BOOK_MISMATCH was blocking -- so one suspicious empty read, once
+        # caught here, could never be superseded by a later, confirming
+        # empty read, and every subsequent assess() kept comparing against
+        # the SAME stale snapshot, re-triggering BOOK_MISMATCH on every
+        # cycle for up to VIX_SHADOW_BOOK_MAX_AGE_SEC (1h) regardless of how
+        # many times reality had already confirmed flat. The DEAD result and
+        # its cooldown still stand for THIS cycle (a real pause before
+        # trusting a read that contradicted memory) -- only the memory
+        # itself gets corrected, so the NEXT cycle compares against current
+        # truth instead of repeating the same stale mismatch. This matters
+        # more now than when originally written: fast buy-then-flatten
+        # round-trips (monitor/svix_manual_campaign.py's tier-3 exits) are a
+        # normal, designed pattern now, not just a transient API glitch, so
+        # this exact sequence -- held, then genuinely flat minutes later --
+        # is expected to recur regularly, not rarely.
+        _save_shadow_book(normalized)
         result = SessionResult(
             state=DEAD,
             reason="BOOK_MISMATCH: held:[] but shadow book had SVIX/VXX/UVXY within max age",
-            buying_power=buying_power, checks=checks,
+            buying_power=buying_power, equity=equity, checks=checks,
         )
         _save_state(result)
         return result
@@ -186,6 +222,7 @@ def assess() -> SessionResult:
         last_refresh_at=time.time(),
         account_ok=True,
         buying_power=buying_power,
+        equity=equity,
         client=client,
         checks=checks,
     )
