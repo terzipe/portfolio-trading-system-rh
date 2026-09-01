@@ -1,16 +1,24 @@
 """
 monitor/vix_percentile.py — percentile-rung threshold table for the SVIX
-ladder. compute_thresholds() is pure (no I/O); refresh()/needs_refresh()/
-is_stale() are exercised against a tmp_path-isolated state file with
-data.fred.fetch_vix_closes monkeypatched, so none of this touches the
-network. See VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md v2.0 §2.
+ladder + LONG_VOL_TACTICAL's Gate A threshold. compute_thresholds() is pure
+(no I/O); refresh()/needs_refresh()/is_stale() are exercised against a
+tmp_path-isolated state file with data.fred.fetch_dated_series
+monkeypatched, so none of this touches the network. See
+VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md v2.0 §2.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from monitor import vix_percentile
 from data.fred import FredError
+
+
+def _dated_closes(values: list[float], start: date | None = None) -> list[tuple[date, float]]:
+    """Recent, evenly-spaced dates so every value falls inside any
+    reasonable lookback window (including Gate A's shorter one)."""
+    start = start or (date.today() - timedelta(days=len(values)))
+    return [(start + timedelta(days=i), v) for i, v in enumerate(values)]
 
 
 @pytest.fixture
@@ -93,7 +101,7 @@ def test_staleness_status_never_refreshed(isolated_state):
 
 
 def test_staleness_status_fresh_refresh(isolated_state, monkeypatch):
-    monkeypatch.setattr(vix_percentile, "fetch_vix_closes", lambda years: [10.0, 20.0, 30.0])
+    monkeypatch.setattr(vix_percentile, "fetch_dated_series", lambda series_id, years: _dated_closes([10.0, 20.0, 30.0]))
     vix_percentile.refresh()
     status = vix_percentile.staleness_status()
     assert status["is_stale"] is False
@@ -112,7 +120,7 @@ def test_staleness_status_reports_age_of_a_stale_cache(isolated_state):
 # ── refresh() ────────────────────────────────────────────────────────
 
 def test_refresh_fetches_and_persists_when_due(isolated_state, monkeypatch):
-    monkeypatch.setattr(vix_percentile, "fetch_vix_closes", lambda years: [10.0, 20.0, 30.0, 40.0, 50.0])
+    monkeypatch.setattr(vix_percentile, "fetch_dated_series", lambda series_id, years: _dated_closes([10.0, 20.0, 30.0, 40.0, 50.0]))
     state = vix_percentile.refresh()
     assert state["refreshed_at"] is not None
     assert state["sample_size"] == 5
@@ -123,7 +131,7 @@ def test_refresh_fetches_and_persists_when_due(isolated_state, monkeypatch):
 
 def test_refresh_noop_when_not_due(isolated_state, monkeypatch):
     calls = []
-    monkeypatch.setattr(vix_percentile, "fetch_vix_closes", lambda years: calls.append(1) or [10.0, 20.0])
+    monkeypatch.setattr(vix_percentile, "fetch_dated_series", lambda series_id, years: calls.append(1) or _dated_closes([10.0, 20.0]))
     vix_percentile.refresh()  # first call: due (never refreshed), fetches once
     vix_percentile.refresh()  # second call: not due yet, must not fetch again
     assert len(calls) == 1
@@ -131,24 +139,53 @@ def test_refresh_noop_when_not_due(isolated_state, monkeypatch):
 
 def test_refresh_force_fetches_even_when_not_due(isolated_state, monkeypatch):
     calls = []
-    monkeypatch.setattr(vix_percentile, "fetch_vix_closes", lambda years: calls.append(1) or [10.0, 20.0])
+    monkeypatch.setattr(vix_percentile, "fetch_dated_series", lambda series_id, years: calls.append(1) or _dated_closes([10.0, 20.0]))
     vix_percentile.refresh()
     vix_percentile.refresh(force=True)
     assert len(calls) == 2
 
 
 def test_refresh_keeps_cached_thresholds_on_fetch_failure(isolated_state, monkeypatch):
-    monkeypatch.setattr(vix_percentile, "fetch_vix_closes", lambda years: [10.0, 20.0, 30.0])
+    monkeypatch.setattr(vix_percentile, "fetch_dated_series", lambda series_id, years: _dated_closes([10.0, 20.0, 30.0]))
     vix_percentile.refresh()
     good_thresholds = vix_percentile.get_thresholds()
 
-    def _boom(years):
+    def _boom(series_id, years):
         raise FredError("simulated FRED outage")
 
-    monkeypatch.setattr(vix_percentile, "fetch_vix_closes", _boom)
+    monkeypatch.setattr(vix_percentile, "fetch_dated_series", _boom)
     vix_percentile.refresh(force=True)  # must not raise
     assert vix_percentile.get_thresholds() == good_thresholds  # untouched
 
 
 def test_get_thresholds_none_before_first_refresh(isolated_state):
     assert vix_percentile.get_thresholds() is None
+
+
+# ── get_gate_a_threshold() — Gate A's own, shorter lookback window ────
+
+def test_get_gate_a_threshold_none_before_first_refresh(isolated_state):
+    assert vix_percentile.get_gate_a_threshold() is None
+
+
+def test_refresh_computes_gate_a_threshold_from_its_own_lookback(isolated_state, monkeypatch):
+    # 100 evenly-spaced recent closes, 1..100 -- all within Gate A's
+    # (much shorter) lookback window, so its threshold should differ from
+    # a naive "same window as the ladder" assumption only in which
+    # percentile is applied, not in missing data.
+    monkeypatch.setattr(vix_percentile, "fetch_dated_series", lambda series_id, years: _dated_closes([float(v) for v in range(1, 101)]))
+    state = vix_percentile.refresh()
+    assert state["gate_a_threshold"] is not None
+    assert state["gate_a_percentile"] == vix_percentile.VIX_LONGVOL_CHEAP_PERCENTILE
+    assert state["gate_a_lookback_years"] == vix_percentile.VIX_LONGVOL_PERCENTILE_LOOKBACK_YEARS
+    assert vix_percentile.get_gate_a_threshold() == state["gate_a_threshold"]
+
+
+def test_gate_a_threshold_excludes_closes_older_than_its_own_lookback(isolated_state, monkeypatch):
+    # One very old close (far outside Gate A's window but inside the
+    # ladder's 10y fetch) must not pull Gate A's threshold down.
+    old = [(date.today() - timedelta(days=365 * 9), 1.0)]  # ancient outlier
+    recent = _dated_closes([50.0] * 20)  # all within Gate A's window
+    monkeypatch.setattr(vix_percentile, "fetch_dated_series", lambda series_id, years: old + recent)
+    state = vix_percentile.refresh()
+    assert state["gate_a_threshold"] == 50.0  # the ancient 1.0 was excluded

@@ -22,11 +22,20 @@ batch. Staleness is instead surfaced at read time via is_stale(), which
 vix_ladder.py uses to decide whether the cache is too old to arm a NEW
 campaign on (an already-open campaign keeps running on a stale table rather
 than being force-flattened — see spec §2).
+
+Also carries LONG_VOL_TACTICAL's Gate A threshold (monitor/vix_longvol_
+gates.py), computed from the SAME weekly FRED fetch but against its OWN,
+typically shorter, lookback window (config.VIX_LONGVOL_PERCENTILE_
+LOOKBACK_YEARS) — decoupled from the ladder's VIX_PERCENTILE_LOOKBACK_YEARS
+on purpose (backtesting 2026-08-26 found a 10y window structurally unable
+to fire in a persistently mid-vol regime; a shorter window recalibrates
+"cheap" against the current regime instead of a decade-old one). See
+get_gate_a_threshold() vs. get_thresholds().
 """
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from config import (
     VIX_PERCENTILE_STATE_FILE,
@@ -35,17 +44,26 @@ from config import (
     VIX_PERCENTILE_REFRESH_INTERVAL_DAYS,
     VIX_PERCENTILE_STALE_DAYS,
     VIX_LONGVOL_CHEAP_PERCENTILE,
+    VIX_LONGVOL_PERCENTILE_LOOKBACK_YEARS,
 )
-from data.fred import fetch_vix_closes, FredError
+from data.fred import fetch_dated_series, FredError, VIXCLS
 
-# Every percentile anyone needs cached, so a single weekly refresh/state
-# file serves both the SVIX ladder rungs and the LONG_VOL_TACTICAL cheap-
-# vol gate (monitor/vix_longvol_gates.py) without a second FRED pull/cache.
-_ALL_TRACKED_PERCENTILES = sorted(set(VIX_PERCENTILE_RUNGS) | {VIX_LONGVOL_CHEAP_PERCENTILE})
+# Every percentile the SVIX ladder needs cached, so a single weekly
+# refresh/state file serves all of its rungs without a second FRED pull.
+# Gate A (LONG_VOL_TACTICAL) is tracked separately below -- it uses its
+# OWN, shorter lookback window (VIX_LONGVOL_PERCENTILE_LOOKBACK_YEARS),
+# not VIX_PERCENTILE_LOOKBACK_YEARS, so it can't share this dict (see
+# refresh()/get_gate_a_threshold()).
+_ALL_TRACKED_PERCENTILES = sorted(set(VIX_PERCENTILE_RUNGS))
+# One fetch covers both windows -- Gate A's is sliced from the same data.
+_FETCH_LOOKBACK_YEARS = max(VIX_PERCENTILE_LOOKBACK_YEARS, VIX_LONGVOL_PERCENTILE_LOOKBACK_YEARS)
 
 
 def _default_state() -> dict:
-    return {"refreshed_at": None, "thresholds": {}, "lookback_years": None, "sample_size": None}
+    return {
+        "refreshed_at": None, "thresholds": {}, "lookback_years": None, "sample_size": None,
+        "gate_a_threshold": None, "gate_a_percentile": None, "gate_a_lookback_years": None,
+    }
 
 
 def _load_state() -> dict:
@@ -125,53 +143,63 @@ def staleness_status() -> dict:
 def refresh(force: bool = False) -> dict:
     """Refresh the cached threshold table from FRED if due (or forced).
     Safe to call every weekday — no-ops on days it isn't due. On fetch
-    failure, keeps the existing cache untouched and returns it as-is."""
+    failure, keeps the existing cache untouched and returns it as-is.
+
+    One dated fetch (covering the longer of the ladder's and Gate A's
+    lookback windows) serves both: the ladder's rungs use the full fetch,
+    Gate A's threshold is computed from a shorter trailing sub-window
+    sliced out of the same data — no second FRED call."""
     state = _load_state()
     if not force and not needs_refresh(state):
         return state
     try:
-        closes = fetch_vix_closes(VIX_PERCENTILE_LOOKBACK_YEARS)
+        dated = fetch_dated_series(VIXCLS, _FETCH_LOOKBACK_YEARS)
     except FredError as exc:
         print(f"[vix_percentile] refresh failed, keeping cached thresholds: {exc}")
         return state
+
+    closes = [v for _, v in dated]
     thresholds = compute_thresholds(closes, percentiles=_ALL_TRACKED_PERCENTILES)
+
+    gate_a_cutoff = date.today() - timedelta(days=365 * VIX_LONGVOL_PERCENTILE_LOOKBACK_YEARS)
+    gate_a_closes = [v for d, v in dated if d >= gate_a_cutoff]
+    gate_a_threshold = (
+        compute_thresholds(gate_a_closes, percentiles=[VIX_LONGVOL_CHEAP_PERCENTILE])[VIX_LONGVOL_CHEAP_PERCENTILE]
+        if gate_a_closes else None
+    )
+
     state = {
         "refreshed_at": datetime.now(timezone.utc).isoformat(),
         "thresholds": {str(p): v for p, v in thresholds.items()},
         "lookback_years": VIX_PERCENTILE_LOOKBACK_YEARS,
         "sample_size": len(closes),
+        "gate_a_threshold": gate_a_threshold,
+        "gate_a_percentile": VIX_LONGVOL_CHEAP_PERCENTILE,
+        "gate_a_lookback_years": VIX_LONGVOL_PERCENTILE_LOOKBACK_YEARS,
     }
     _save_state(state)
-    print(f"[vix_percentile] refreshed: {thresholds} (n={len(closes)})")
+    print(f"[vix_percentile] refreshed: {thresholds} (n={len(closes)}); "
+          f"gate_a_threshold={gate_a_threshold} (pct={VIX_LONGVOL_CHEAP_PERCENTILE}, "
+          f"lookback={VIX_LONGVOL_PERCENTILE_LOOKBACK_YEARS}y, n={len(gate_a_closes)})")
     return state
 
 
 def get_thresholds() -> dict[float, float] | None:
-    """Ascending percentile -> VIX-level thresholds from cache, filtered to
-    just the SVIX ladder's rungs (config.VIX_PERCENTILE_RUNGS) — the cached
-    state may hold additional percentiles for other consumers (see
-    get_percentile_level()), but vix_ladder.py's rung-walk must only ever
-    see its own rungs. Returns None if never successfully refreshed.
-    Read-only — does not itself fetch."""
+    """Ascending percentile -> VIX-level thresholds from cache — the SVIX
+    ladder's rungs (config.VIX_PERCENTILE_RUNGS), computed against
+    VIX_PERCENTILE_LOOKBACK_YEARS. Returns None if never successfully
+    refreshed. Read-only — does not itself fetch."""
     state = _load_state()
     if not state["thresholds"]:
         return None
-    wanted = set(VIX_PERCENTILE_RUNGS)
-    return {
-        float(p): v for p, v in sorted(state["thresholds"].items(), key=lambda kv: float(kv[0]))
-        if float(p) in wanted
-    }
+    return {float(p): v for p, v in sorted(state["thresholds"].items(), key=lambda kv: float(kv[0]))}
 
 
-def get_percentile_level(p: float) -> float | None:
-    """VIX level at percentile `p` from the shared cache, or None if it
-    hasn't been computed yet (e.g. `p` isn't in _ALL_TRACKED_PERCENTILES,
-    or nothing has ever refreshed successfully). Used by consumers other
-    than the SVIX ladder — e.g. monitor/vix_longvol_gates.py's cheap-vol
-    gate — that need one specific percentile rather than the ladder's rung
-    set."""
+def get_gate_a_threshold() -> float | None:
+    """LONG_VOL_TACTICAL Gate A's cheap-vol threshold (VIX level at
+    config.VIX_LONGVOL_CHEAP_PERCENTILE, computed against config.
+    VIX_LONGVOL_PERCENTILE_LOOKBACK_YEARS — its own, typically shorter,
+    lookback window, decoupled from the SVIX ladder's). Returns None if
+    never successfully refreshed. Read-only — does not itself fetch."""
     state = _load_state()
-    for key, value in state["thresholds"].items():
-        if float(key) == float(p):
-            return float(value)
-    return None
+    return state.get("gate_a_threshold")

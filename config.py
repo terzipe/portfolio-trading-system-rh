@@ -126,6 +126,21 @@ VIX_LONGVOL_MOMENTUM_MIN_PCT = float(os.getenv("VIX_LONGVOL_MOMENTUM_MIN_PCT", 0
 # firing on essentially any wiggle).
 VIX_LONGVOL_TERM_STRUCTURE_MIN_PCT = float(os.getenv("VIX_LONGVOL_TERM_STRUCTURE_MIN_PCT", 0.05))
 VIX_LONGVOL_MIN_GATES = int(os.getenv("VIX_LONGVOL_MIN_GATES", 2))
+# VXX/UVXY rotation (confirmed 2026-09-01, refined 2026-09-02): LONG_VOL_
+# TACTICAL trades whichever ticker's OWN gates confirm (see vix_regime.
+# _pick_longvol_ticker()). Gate A/B are index-level -- identical for both
+# tickers -- so whenever Gate B alone supplies the score, both tickers
+# confirm together WITHOUT Gate C confirming for either. Momentum magnitude
+# is only compared when BOTH tickers' Gate C independently confirmed (a
+# genuine momentum reading on both sides) -- backtesting the original
+# "always compare raw momentum" version found every historical signal came
+# from A+B alone with momentum negative on both sides, which mechanically
+# favored VXX 100% of the time (UVXY's leverage makes its declines larger
+# in magnitude) for a reason unrelated to conviction. Both the genuine-tie
+# case (within this fraction of each other) AND the A+B-alone case now
+# default to VXX (his call, changed 2026-09-02 from the original UVXY
+# default).
+VIX_LONGVOL_MOMENTUM_TIE_PCT = float(os.getenv("VIX_LONGVOL_MOMENTUM_TIE_PCT", 0.02))
 
 # ── SVIX manual campaign (monitor/svix_manual_campaign.py) — a SECOND,
 # independent SVIX campaign alongside the ladder above. The ladder buys SVIX

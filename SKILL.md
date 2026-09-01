@@ -304,6 +304,15 @@ if "access_token" in new and "refresh_token" in new:
 ---
 
 ## Lessons learned
+- 2026-09-01: Clean daily run. Macro REDUCED (score 54.7/100), 1 held position monitored alongside 10 watchlist tickers, no alerts fired.
+- 2026-08-31: Clean daily run. Macro REDUCED (score 61.6/100), 1 held position monitored across 10 watchlist tickers, no alerts fired.
+- 2026-08-28: Clean daily run. Macro REDUCED (score 68.8/100), 1 held position monitored across 10 watchlist tickers, no alerts fired.
+- 2026-08-27: Clean daily run. Macro REDUCED (score 65.1/100), 1 held position monitored across 10 watchlist tickers, no alerts fired.
+- 2026-08-26: Clean daily run. Macro REDUCED (score 65.0/100), 1 held position monitored across 10 watchlist tickers, no alerts fired.
+- 2026-08-25: Clean daily run. Macro REDUCED (score 63.1), 1 held position monitored across 10 watchlist tickers, no alerts fired.
+- 2026-08-24: Clean daily run. Macro REDUCED (score 61.7/100), 1 held position monitored across 10 watchlist tickers, no alerts fired.
+- 2026-08-21: Clean daily run. Macro REDUCED (score 64.6/100), 1 held position monitored across 10 watchlist tickers, no alerts fired.
+- 2026-08-20: Portfolio P&L hit -7.1% intraday, triggering the daily drawdown stop at the -5.0% limit under a REDUCED macro posture (score 60.6/100) — confirms the hard loss-limit circuit breaker fires correctly and that a deteriorating macro environment warrants tighter position sizing before the session opens.
 - 2026-08-19: Clean daily run. Macro REDUCED (score 61.5), no alerts fired, no news available — confirms that missing news highlights do not block the batch loop from completing normally.
 - 2026-08-18: Clean daily run. Macro REDUCED (score: 56.0/100), no alerts fired; score remains in the 53–57 range for the second confirmed post-recovery session, suggesting the pipeline is stable but macro posture continues to warrant a cautious reduced stance until the score sustains above 60 across multiple sessions.
 - 2026-08-17: Clean daily run. Macro REDUCED (score: 64.5/100), no alerts fired; score remains comfortably above the 60-threshold boundary, continuing the stable REDUCED posture streak first established after pipeline recovery — no action required.
@@ -408,6 +417,13 @@ already; see root repo git history for the fix).
   returns.
 
 ### VIX Trader — Lessons learned
+- 2026-09-01: posture=CASH, VIX=17.8, session=HEALTHY, actions=1, executed=0, paper_signals=1
+- 2026-08-31: posture=CASH, VIX=17.98, session=HEALTHY, actions=1, executed=0, paper_signals=1
+- 2026-08-28: posture=CASH, VIX=18.04, session=HEALTHY, actions=1, executed=0, paper_signals=1
+- 2026-08-27: posture=CASH, VIX=17.71, session=HEALTHY, actions=1, executed=0, paper_signals=1
+- 2026-08-26: posture=CASH, VIX=17.88, session=HEALTHY, actions=1, executed=0, paper_signals=1
+- 2026-08-25: posture=CASH, VIX=None, session=HEALTHY, actions=1, executed=0, paper_signals=1
+- 2026-08-24: posture=LONG_VOL_TACTICAL, VIX=18.48, session=HEALTHY, actions=1, executed=1, paper_signals=1
 - 2026-08-22: Added a tail-risk ceiling to the SVIX ladder (VIX_LADDER_MAX_ARM_LEVEL,
   default 70) after tracing the "VIX gaps to 60 over a weekend and climbs to 90" scenario:
   because _next_unbought_rung() always returns the *lowest* unbought rung ≤ VIX and evaluate()

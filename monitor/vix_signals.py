@@ -99,13 +99,25 @@ def evaluate_fade_spike(uw_client, vix: float | None, uvxy_history: list[float] 
     return lower_high
 
 
-def decide_actions(posture: str, positions: list[dict]) -> list[Action]:
+def decide_actions(posture: str, positions: list[dict], longvol_ticker: str | None = None) -> list[Action]:
     """
     Map posture + current UVXY/VXX option holdings to actions. SVIX is no
     longer posture-driven — monitor/vix_ladder.py owns all SVIX entries and
     exits independently, on its own VIX-level campaign, regardless of what
     posture says (see VIX_SVIX_LADDER_STRATEGY_REQUIREMENTS.md). This
     function is options-only now.
+
+    `longvol_ticker` (added 2026-09-01, VXX/UVXY rotation): which ticker
+    vix_regime.compute_posture() actually confirmed for THIS cycle -- see
+    its _pick_longvol_ticker() for the rotation/tie-break rule. Still
+    mutually exclusive with holding the other (his call, 2026-09-01):
+    holding EITHER VXX or UVXY calls blocks a new buy of either, same as
+    before this rotation existed -- only which ticker gets bought when
+    entering fresh is new. Defaults to None for callers that haven't been
+    updated yet, in which case LONG_VOL_TACTICAL can't fire a fresh entry
+    (matches vix_regime.compute_posture()'s own "no gates passed -> never
+    triggers" fallback convention) but an already-held position still HOLDs
+    normally.
     """
     actions: list[Action] = []
     uvxy_options = [p for p in positions if p.get("ticker") == "UVXY" and p.get("type") == "option"]
@@ -121,10 +133,16 @@ def decide_actions(posture: str, positions: list[dict]) -> list[Action]:
         return actions
 
     if posture == LONG_VOL_TACTICAL:
-        if not uvxy_options and not vxx_options:
-            actions.append(Action(BUY_VXX_CALL, "VXX", "posture=LONG_VOL_TACTICAL, Aug-Oct bias, no calls held"))
-        else:
+        if uvxy_options or vxx_options:
             actions.append(Action(HOLD, "VXX/UVXY", "posture=LONG_VOL_TACTICAL, calls already held"))
+        elif longvol_ticker == "UVXY":
+            actions.append(Action(BUY_UVXY_CALL, "UVXY", "posture=LONG_VOL_TACTICAL, UVXY's own gates confirmed, no calls held"))
+        elif longvol_ticker == "VXX":
+            actions.append(Action(BUY_VXX_CALL, "VXX", "posture=LONG_VOL_TACTICAL, VXX's own gates confirmed, no calls held"))
+        else:
+            # Posture fired but no ticker was resolved (stale caller not
+            # passing longvol_ticker yet) -- fail closed, no blind default.
+            actions.append(Action(NOOP, None, "posture=LONG_VOL_TACTICAL but no longvol_ticker resolved -- not buying blind"))
         return actions
 
     # CASH

@@ -15,22 +15,22 @@ from data.fred import FredError
 # ── Gate A: cheap vol floor ──────────────────────────────────────────
 
 def test_gate_a_confirms_when_vix_below_threshold(monkeypatch):
-    monkeypatch.setattr(vix_percentile, "get_percentile_level", lambda p: 20.0)
+    monkeypatch.setattr(vix_percentile, "get_gate_a_threshold", lambda: 20.0)
     assert gates.cheap_vol_gate(15.0) is True
 
 
 def test_gate_a_does_not_confirm_when_vix_above_threshold(monkeypatch):
-    monkeypatch.setattr(vix_percentile, "get_percentile_level", lambda p: 20.0)
+    monkeypatch.setattr(vix_percentile, "get_gate_a_threshold", lambda: 20.0)
     assert gates.cheap_vol_gate(25.0) is False
 
 
 def test_gate_a_fails_closed_with_no_vix(monkeypatch):
-    monkeypatch.setattr(vix_percentile, "get_percentile_level", lambda p: 20.0)
+    monkeypatch.setattr(vix_percentile, "get_gate_a_threshold", lambda: 20.0)
     assert gates.cheap_vol_gate(None) is False
 
 
 def test_gate_a_fails_closed_with_no_cached_threshold(monkeypatch):
-    monkeypatch.setattr(vix_percentile, "get_percentile_level", lambda p: None)
+    monkeypatch.setattr(vix_percentile, "get_gate_a_threshold", lambda: None)
     assert gates.cheap_vol_gate(15.0) is False
 
 
@@ -104,10 +104,12 @@ def test_ratio_n_sessions_ago_fails_closed_on_insufficient_history(monkeypatch):
 
 # ── Gate C: VXX momentum ────────────────────────────────────────────
 
-def _uw_with_closes(closes):
-    return SimpleNamespace(ohlc=lambda ticker, candle_size="1d": {
-        "data": [{"close": str(c), "market_time": "r"} for c in closes]
-    })
+def _uw_with_closes(closes, expected_ticker=None):
+    def _ohlc(ticker, candle_size="1d"):
+        if expected_ticker is not None:
+            assert ticker == expected_ticker
+        return {"data": [{"close": str(c), "market_time": "r"} for c in closes]}
+    return SimpleNamespace(ohlc=_ohlc)
 
 
 def test_gate_c_confirms_on_sufficient_positive_momentum():
@@ -130,12 +132,51 @@ def test_gate_c_fails_closed_on_insufficient_history():
     assert gates.momentum_gate(uw, lookback_sessions=10, min_pct=0.05) is False
 
 
+def test_gate_c_defaults_to_vxx():
+    uw = _uw_with_closes([20.0] * 10 + [21.5], expected_ticker="VXX")
+    assert gates.momentum_gate(uw, lookback_sessions=10, min_pct=0.05) is True
+
+
+def test_gate_c_uses_uvxy_when_requested():
+    uw = _uw_with_closes([20.0] * 10 + [21.5], expected_ticker="UVXY")
+    assert gates.momentum_gate(uw, lookback_sessions=10, min_pct=0.05, ticker="UVXY") is True
+
+
+def test_momentum_pct_exposes_the_raw_reading():
+    """Added 2026-09-01 for the VXX/UVXY rotation tie-break -- the raw
+    magnitude, not just whether it cleared the floor."""
+    uw = _uw_with_closes([20.0] * 10 + [21.5])  # +7.5%
+    pct = gates._momentum_pct(uw, "VXX", lookback_sessions=10)
+    assert pct == pytest.approx(0.075)
+
+
+def test_momentum_pct_fails_closed_on_insufficient_history():
+    uw = _uw_with_closes([20.0])
+    assert gates._momentum_pct(uw, "VXX", lookback_sessions=10) is None
+
+
+def test_evaluate_passes_ticker_through_to_momentum_pct(monkeypatch):
+    monkeypatch.setattr(gates, "cheap_vol_gate", lambda vix_now: True)
+    monkeypatch.setattr(gates, "term_structure_gate", lambda vix_now, vix3m_now, lookback_sessions=None: False)
+    seen = {}
+
+    def _fake_momentum_pct(uw, ticker, lookback_sessions):
+        seen["ticker"] = ticker
+        return 0.15  # clears the default 10% floor -- gate_c confirmed
+
+    monkeypatch.setattr(gates, "_momentum_pct", _fake_momentum_pct)
+    result = gates.evaluate(uw_client=object(), vix_now=15.0, vix3m_now=19.0, ticker="UVXY")
+    assert seen["ticker"] == "UVXY"
+    assert result.momentum_pct == 0.15
+    assert any("UVXY momentum" in r for r in result.reasons)
+
+
 # ── Combined scoring ─────────────────────────────────────────────────
 
 def test_evaluate_confirms_at_two_of_three(monkeypatch):
     monkeypatch.setattr(gates, "cheap_vol_gate", lambda vix_now: True)
     monkeypatch.setattr(gates, "term_structure_gate", lambda vix_now, vix3m_now, lookback_sessions=None: True)
-    monkeypatch.setattr(gates, "momentum_gate", lambda uw, lookback_sessions=None, min_pct=None: False)
+    monkeypatch.setattr(gates, "_momentum_pct", lambda uw, ticker, lookback_sessions: 0.02)  # below the 10% floor
 
     result = gates.evaluate(uw_client=object(), vix_now=15.0, vix3m_now=19.0)
     assert result.score == 2
@@ -146,7 +187,7 @@ def test_evaluate_confirms_at_two_of_three(monkeypatch):
 def test_evaluate_does_not_confirm_at_one_of_three(monkeypatch):
     monkeypatch.setattr(gates, "cheap_vol_gate", lambda vix_now: True)
     monkeypatch.setattr(gates, "term_structure_gate", lambda vix_now, vix3m_now, lookback_sessions=None: False)
-    monkeypatch.setattr(gates, "momentum_gate", lambda uw, lookback_sessions=None, min_pct=None: False)
+    monkeypatch.setattr(gates, "_momentum_pct", lambda uw, ticker, lookback_sessions: 0.02)
 
     result = gates.evaluate(uw_client=object(), vix_now=15.0, vix3m_now=19.0)
     assert result.score == 1
@@ -156,7 +197,7 @@ def test_evaluate_does_not_confirm_at_one_of_three(monkeypatch):
 def test_evaluate_confirms_at_three_of_three(monkeypatch):
     monkeypatch.setattr(gates, "cheap_vol_gate", lambda vix_now: True)
     monkeypatch.setattr(gates, "term_structure_gate", lambda vix_now, vix3m_now, lookback_sessions=None: True)
-    monkeypatch.setattr(gates, "momentum_gate", lambda uw, lookback_sessions=None, min_pct=None: True)
+    monkeypatch.setattr(gates, "_momentum_pct", lambda uw, ticker, lookback_sessions: 0.15)
 
     result = gates.evaluate(uw_client=object(), vix_now=15.0, vix3m_now=19.0)
     assert result.score == 3
@@ -170,7 +211,7 @@ def test_evaluate_does_not_confirm_without_gate_a_even_at_score_two(monkeypatch)
     # to, must not fire the posture without vol actually being cheap.
     monkeypatch.setattr(gates, "cheap_vol_gate", lambda vix_now: False)
     monkeypatch.setattr(gates, "term_structure_gate", lambda vix_now, vix3m_now, lookback_sessions=None: True)
-    monkeypatch.setattr(gates, "momentum_gate", lambda uw, lookback_sessions=None, min_pct=None: True)
+    monkeypatch.setattr(gates, "_momentum_pct", lambda uw, ticker, lookback_sessions: 0.15)
 
     result = gates.evaluate(uw_client=object(), vix_now=15.0, vix3m_now=19.0)
     assert result.score == 2  # B and C both confirmed...
