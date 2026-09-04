@@ -166,6 +166,25 @@ Two gotchas either way:
 
 ---
 
+## Claude Code — Alpaca MCP
+
+`.mcp.json` in this project root wires in [Alpaca's official MCP server](https://github.com/alpacahq/alpaca-mcp-server) (`uvx alpaca-mcp-server`) for interactive Claude Code sessions opened here. It authenticates with the *same* `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY` pair the VIX Trader BOT's own `alpaca-py` `TradingClient` already uses (see `monitor/vix_session.py`) — one credential pair, two consumers.
+
+`.mcp.json` only ever contains `${VAR}` expansion references, never real key values, so it's safe to commit. Before launching `claude` in this directory, export the credentials into your shell so the expansion has something to resolve:
+
+```bash
+set -a; source .env; set +a
+claude
+```
+
+Defaults baked into `.mcp.json`:
+- `ALPACA_PAPER_TRADE=true` — matches the bot's hardcoded `paper=True`; never points at the live account.
+- `ALPACA_TOOLSETS=account,assets,stock-data,crypto-data,options-data,watchlists,news` — **read-only toolsets only**. The `trading` and `locates` toolsets (order placement, position changes) are deliberately left out: the VIX ladder's self-heal and pending-order reconciliation (`monitor/vix_ladder.py`) assume they know about every share the account holds, and an ad hoc MCP-driven trade outside that bookkeeping (unlike `svix_manual_campaign`'s tracked manual buys) can desync it the same way the shadow-book/`BOOK_MISMATCH` logic in `vix_session.py` guards against. If you want Claude to be able to place or modify orders directly, add `trading` to `ALPACA_TOOLSETS` deliberately and keep that risk in mind.
+
+Verify the connection with `/mcp` inside Claude Code once it's running.
+
+---
+
 ## Watchlist / Universe
 
 Layer 0 builds the universe from two sources:
