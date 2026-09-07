@@ -18,11 +18,21 @@ priority order:
     20-day dispersion in EITHER series precedes spikes more reliably than a
     simply "low" VIX level does (Thrasher). "Combined compression of both
     is the highest-alert state" — required here on BOTH series, not either.
-  Tier 3 — front-of-curve term structure: VIX/VIX3M ratio rising off a deep
-    contango reading — reuses vix_longvol_gates.term_structure_gate()'s
-    machinery but with a sharper/shorter lookback tuned for the earliest
-    exit warning, not entry confirmation (Gate B's 15-session default is
-    calibrated for the opposite use case).
+  Tier 3 — run-up-exhaustion take-profit (historically mislabeled
+    "term structure"). Fires when the VIX/VIX3M ratio has FALLEN >= 5% over
+    5 sessions — i.e. VIX collapsing faster than VIX3M, the curve steepening
+    into DEEP contango. Reuses vix_longvol_gates.term_structure_gate() as-is
+    (a shorter 5-session lookback). NOTE, verified by backtest 2026-09-07
+    (backtest_svix_manual.py diagnostics): despite the "term structure"
+    name and the old docstring's "ratio rising off deep contango" claim,
+    this fires on the OPPOSITE — a falling ratio, i.e. VIX already dropping
+    hard (100% of triggers had VIX down, mean -18%/5d; median VIX 16,
+    median ratio 0.85). It is not a spike warning (a real VIX spike
+    followed only 26% of the time) — it's a fast take-profit that exits
+    SVIX into a sharp run-up. It is nonetheless LOAD-BEARING: --tier3-compare
+    showed weakening or sign-flipping it halves realized P&L ($22k -> $13k)
+    and blows the worst drawdown from -15.5% to -32.8%. Left exactly as-is
+    by decision 2026-09-07; only this comment was corrected.
   Tier 4 — confirmers (SKEW): never used alone, only adds conviction.
 
 VVIX/SKEW come from yfinance — FRED does not carry either series (checked
@@ -40,9 +50,10 @@ exit_level mapping (svix_manual_campaign.py's exit-response logic):
       by a later level-1-only reading, see run_exit_cycle()'s docstring.
   2 — tier 2 (compression) confirmed — arm/tighten the resting stop to
       config.SVIX_MANUAL_STOP_PCT (tighter than tier 1's)
-  3 — tier 3 (term structure) confirmed on VIX_LEADING_TIER3_CONFIRM_DAYS
-      CONSECUTIVE trading days — full flatten immediately, regardless of
-      any armed stop
+  3 — tier 3 (run-up-exhaustion take-profit) confirmed on
+      VIX_LEADING_TIER3_CONFIRM_DAYS CONSECUTIVE trading days — full flatten
+      immediately, regardless of any armed stop or RIDE MODE (tier 3 is an
+      absolute override in both exit regimes — see svix_manual_campaign.py).
 
 Tier 3 requiring multiple consecutive days (not just today) was wired live
 2026-08-29 after backtest_svix_manual.py --tier3-confirm-days found the
@@ -94,7 +105,7 @@ from monitor.vix_longvol_gates import term_structure_gate
 class LeadingSignalResult:
     tier1_divergence: bool
     tier2_compression: bool
-    tier3_term_structure: bool  # TODAY's raw reading -- may be True even when exit_level < 3 (streak not yet met)
+    tier3_term_structure: bool  # kept name; really "run-up exhaustion" (VIX/VIX3M ratio falling) -- see module docstring. TODAY's raw reading -- may be True even when exit_level < 3 (streak not yet met)
     tier4_skew_confirmer: bool
     tier3_confirmed_days: int  # consecutive trading days tier3 has read confirmed, including today
     score: int  # count of tier1-3 confirmed (tier3 counts on today's raw reading); tier4 never counted (confirmer only)
@@ -278,6 +289,11 @@ def evaluate(
 
     tier1 = divergence_gate(vix_closes, vvix_closes) if vix_closes and vvix_closes else False
     tier2 = compression_gate(vix_closes, vvix_closes) if vix_closes and vvix_closes else False
+    # tier 3 -- "term structure" is a misnomer (see module docstring): this
+    # fires on the VIX/VIX3M ratio FALLING >= min_pct, i.e. a sharp VIX
+    # drop / deepening contango, and functions as a run-up-exhaustion
+    # take-profit, not a spike warning. Load-bearing (backtest 2026-09-07),
+    # left as-is.
     tier3 = term_structure_gate(
         vix_now, vix3m_now,
         lookback_sessions=VIX_LEADING_TERM_STRUCTURE_SESSIONS,
@@ -289,7 +305,8 @@ def evaluate(
     reasons.append(f"tier 1 (VVIX/VIX divergence, {VIX_LEADING_DIVERGENCE_SESSIONS}d): {'confirmed' if tier1 else 'no'}")
     reasons.append(f"tier 2 (VIX+VVIX compression, {VIX_LEADING_COMPRESSION_WINDOW}d SD <= {VIX_LEADING_COMPRESSION_PERCENTILE:g}th pct): {'confirmed' if tier2 else 'no'}")
     reasons.append(
-        f"tier 3 (term structure, {VIX_LEADING_TERM_STRUCTURE_SESSIONS}d): {'confirmed today' if tier3 else 'no'} "
+        f"tier 3 (run-up exhaustion / VIX-VIX3M ratio down {VIX_LEADING_TERM_STRUCTURE_MIN_PCT:.0%} in "
+        f"{VIX_LEADING_TERM_STRUCTURE_SESSIONS}d): {'confirmed today' if tier3 else 'no'} "
         f"— {tier3_confirmed_days}/{VIX_LEADING_TIER3_CONFIRM_DAYS} consecutive day(s)"
     )
     reasons.append(f"tier 4 (SKEW confirmer, {VIX_LEADING_SKEW_SESSIONS}d): {'confirmed' if tier4 else 'no'}")

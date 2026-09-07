@@ -192,6 +192,41 @@ SVIX_MANUAL_TIER1_STOP_PCT = float(os.getenv("SVIX_MANUAL_TIER1_STOP_PCT", 0.05)
 SVIX_MANUAL_STATE_FILE = VIX_DATA_DIR / "svix_manual_state.json"
 SVIX_MANUAL_CACHE_FILE = VIX_DATA_DIR / "svix_manual_cache.json"
 
+# ── SVIX manual campaign — RIDE MODE (wired live 2026-09-07) ──────────────
+# A second exit regime for when SVIX is trending up hard and the tight
+# tier-1/tier-2 stop keeps chopping the position out before the post-spike
+# recovery leg is captured. Backtested conclusively 2026-09-07
+# (backtest_svix_manual.py --ride / --ride-sweep / --tier3-compare, full
+# real SVIX history 2022-03-30 -> 2026-09-04):
+#   ride OFF -> $22,318 realized, 42% time-in-mkt, worst mark -15.5%, +8.3% drawdown-avoided
+#   ride ON  -> $24,346 realized, 42% time-in-mkt, worst mark -15.5%, +8.3% drawdown-avoided
+# i.e. +$2k / +9% realized at IDENTICAL drawdown protection, across all
+# 189 sweep combos (trail style fixed/atr/swing, width 6-8%, momentum
+# 6-10%, min-P&L 3-8% all landed within a tight band -- fixed_pct chosen
+# for simplicity, no measured edge to atr/swing_low). See
+# project_svix_manual_strategy memory for the full decision record.
+#
+# Engage ride mode when, all on PURE SVIX price action (his call 2026-09-07 --
+# no macro/term-structure confirmation): SVIX up >= _MOMENTUM_PCT over
+# _SESSIONS trading days, price within _NEAR_HIGH_BUF of the _SESSIONS-day
+# high, and the position green by >= _MIN_PNL_PCT. While riding, tier-1 AND
+# tier-2 stops are fully suspended; the only protection besides tier 3 is a
+# wide trailing exit at ride_peak * (1 - _TRAIL_PCT) -- since ride mode only
+# engages when already >= _MIN_PNL_PCT green, that trailing level starts out
+# barely below cost and only rises with the peak, so a separate cost-basis
+# disaster floor would always be shadowed by it (verified in backtest: a
+# 13%-below-cost floor never fired) -- deliberately not included. Tier-3
+# sustained flatten stays an ABSOLUTE override. If momentum fizzles below
+# _EXIT_MOMENTUM_PCT without hitting an exit, snap back to the normal
+# tight-stop regime (re-arms next cycle).
+ENABLE_SVIX_MANUAL_RIDE = os.getenv("ENABLE_SVIX_MANUAL_RIDE", "true").lower() == "true"
+SVIX_MANUAL_RIDE_SESSIONS = int(os.getenv("SVIX_MANUAL_RIDE_SESSIONS", 10))
+SVIX_MANUAL_RIDE_MOMENTUM_PCT = float(os.getenv("SVIX_MANUAL_RIDE_MOMENTUM_PCT", 0.08))
+SVIX_MANUAL_RIDE_NEAR_HIGH_BUF = float(os.getenv("SVIX_MANUAL_RIDE_NEAR_HIGH_BUF", 0.015))
+SVIX_MANUAL_RIDE_MIN_PNL_PCT = float(os.getenv("SVIX_MANUAL_RIDE_MIN_PNL_PCT", 0.05))
+SVIX_MANUAL_RIDE_EXIT_MOMENTUM_PCT = float(os.getenv("SVIX_MANUAL_RIDE_EXIT_MOMENTUM_PCT", 0.02))
+SVIX_MANUAL_RIDE_TRAIL_PCT = float(os.getenv("SVIX_MANUAL_RIDE_TRAIL_PCT", 0.07))
+
 # ── Leading-indicator exit stack (monitor/vix_leading_signals.py) — VVIX/
 # VIX divergence (tier 1, primary), VIX+VVIX range compression (tier 2),
 # front-of-curve term structure (tier 3), confirmers (tier 4, never used
@@ -223,9 +258,14 @@ VIX_LEADING_DIVERGENCE_MIN_PP = float(os.getenv("VIX_LEADING_DIVERGENCE_MIN_PP",
 VIX_LEADING_COMPRESSION_WINDOW = int(os.getenv("VIX_LEADING_COMPRESSION_WINDOW", 20))
 VIX_LEADING_COMPRESSION_PERCENTILE = float(os.getenv("VIX_LEADING_COMPRESSION_PERCENTILE", 15))
 VIX_LEADING_COMPRESSION_LOOKBACK_YEARS = float(os.getenv("VIX_LEADING_COMPRESSION_LOOKBACK_YEARS", 2))
-# Tier 3 reuses vix_longvol_gates.term_structure_gate()'s machinery but with
-# its own, sharper/shorter lookback -- Gate B's 15-session default is tuned
-# for confirming an ENTRY, not for the earliest possible EXIT warning.
+# Tier 3 ("term structure" -- a misnomer, see monitor/vix_leading_signals.py
+# and monitor/vix_longvol_gates.term_structure_gate()'s direction note):
+# fires when the VIX/VIX3M ratio has FALLEN >= _MIN_PCT over _SESSIONS
+# sessions -- VIX dropping hard / contango deepening. Functions as a
+# run-up-exhaustion take-profit on SVIX, not a spike warning. Backtested
+# load-bearing 2026-09-07 (backtest_svix_manual.py --tier3-compare:
+# weakening or sign-flipping it halves realized P&L and doubles the worst
+# drawdown). 5-session lookback (vs Gate B's 15) for a faster take-profit.
 VIX_LEADING_TERM_STRUCTURE_SESSIONS = int(os.getenv("VIX_LEADING_TERM_STRUCTURE_SESSIONS", 5))
 VIX_LEADING_TERM_STRUCTURE_MIN_PCT = float(os.getenv("VIX_LEADING_TERM_STRUCTURE_MIN_PCT", 0.05))
 VIX_LEADING_SKEW_SESSIONS = int(os.getenv("VIX_LEADING_SKEW_SESSIONS", 5))

@@ -43,6 +43,23 @@ Once armed (level 1 or 2), the stop is checked against live price every
 cycle regardless of the CURRENT exit_level -- a stop armed on a signal
 that's since gone quiet still protects the position.
 
+RIDE MODE (wired live 2026-09-07, backtested conclusively -- see config.py's
+SVIX_MANUAL_RIDE_* block and project_svix_manual_strategy memory). A second
+exit regime for when SVIX is trending up hard and the tight tier-1/tier-2
+stop would keep chopping the position out before the post-spike recovery
+leg is captured. run_exit_cycle() ENGAGES ride mode when, all on pure SVIX
+price action: N-day momentum >= SVIX_MANUAL_RIDE_MOMENTUM_PCT, price within
+SVIX_MANUAL_RIDE_NEAR_HIGH_BUF of the N-day high, and the position green by
+>= SVIX_MANUAL_RIDE_MIN_PNL_PCT. While riding: tier-1 AND tier-2 stops are
+fully SUSPENDED (armed_stop cleared); the only protection besides tier 3 is
+a wide trailing exit at ride_peak * (1 - SVIX_MANUAL_RIDE_TRAIL_PCT).
+Tier 3 sustained stays an ABSOLUTE override in both regimes. If momentum
+decays below
+SVIX_MANUAL_RIDE_EXIT_MOMENTUM_PCT without hitting an exit, ride mode ends
+and the next cycle re-arms the normal tight stop at the then-current price.
+Ride state (ride_mode / ride_peak) resets to idle on any full exit, exactly
+like armed_stop.
+
 Retry-until-flat: a flatten order that comes back rejected/canceled/expired
 is dropped from pending_orders (shares are still open, untouched) rather
 than retried in place — the NEXT run_exit_cycle() call sees shares > 0 with
@@ -69,6 +86,13 @@ from config import (
     SVIX_MANUAL_BUDGET_DOLLARS,
     SVIX_MANUAL_STOP_PCT,
     SVIX_MANUAL_TIER1_STOP_PCT,
+    ENABLE_SVIX_MANUAL_RIDE,
+    SVIX_MANUAL_RIDE_SESSIONS,
+    SVIX_MANUAL_RIDE_MOMENTUM_PCT,
+    SVIX_MANUAL_RIDE_NEAR_HIGH_BUF,
+    SVIX_MANUAL_RIDE_MIN_PNL_PCT,
+    SVIX_MANUAL_RIDE_EXIT_MOMENTUM_PCT,
+    SVIX_MANUAL_RIDE_TRAIL_PCT,
 )
 from monitor.vix_executor import _submit_market_order
 from monitor import vix_ladder  # self_heal() only -- reads the ladder's tracked qty, read-only, no mutation
@@ -81,6 +105,8 @@ def _default_state() -> dict:
         "last_alerted_rung": None,  # alert dedup only -- does NOT gate buying
         "armed_stop": None,         # price level; flatten triggers if live price <= this
         "pending_orders": [],       # [{"kind":"buy"|"sell","order_id","qty",...}] -- submitted, not yet confirmed
+        "ride_mode": False,         # RIDE MODE engaged (tier-1/2 stops suspended) -- see run_exit_cycle()
+        "ride_peak": None,          # highest SVIX price seen since ride mode engaged; the wide trailing exit keys off this
     }
 
 
@@ -186,7 +212,32 @@ def get_status() -> dict:
         "pending_orders": state["pending_orders"],
         "budget_remaining": remaining_budget(state),
         "budget_total": SVIX_MANUAL_BUDGET_DOLLARS,
+        "ride_mode": state.get("ride_mode", False),
+        "ride_peak": state.get("ride_peak"),
     }
+
+
+def _ride_momentum(svix_closes: list[float] | None, sessions: int) -> float | None:
+    """SVIX's own close-to-close return over `sessions` trading days
+    (oldest-first list, as fetch_ticker_history() returns). None if there
+    aren't enough closes -- ride mode fails closed, same as everything else
+    here."""
+    if not svix_closes or len(svix_closes) <= sessions:
+        return None
+    then, now = svix_closes[-1 - sessions], svix_closes[-1]
+    if not then:
+        return None
+    return (now / then) - 1
+
+
+def _ride_near_high(svix_closes: list[float] | None, live_price: float, sessions: int, buf: float) -> bool:
+    """True if `live_price` is within `buf` (fraction) of the highest of the
+    last `sessions` closes (live_price itself included, so a fresh high
+    trivially qualifies). False on insufficient history (fail closed)."""
+    if not svix_closes or len(svix_closes) < sessions:
+        return False
+    window_high = max([*svix_closes[-sessions:], live_price])
+    return live_price >= window_high * (1 - buf)
 
 
 def self_heal(real_positions: list[dict]) -> bool:
@@ -326,6 +377,8 @@ def _consume_lots(qty: float) -> None:
         state["armed_stop"] = None
         state["rungs_fired"] = []
         state["last_alerted_rung"] = None
+        state["ride_mode"] = False
+        state["ride_peak"] = None
     _save_state(state)
 
 
@@ -368,24 +421,29 @@ def reconcile_pending_orders(client) -> None:
     _save_state(state)
 
 
-def run_exit_cycle(client, live_price: float, signal_result) -> dict:
+def run_exit_cycle(client, live_price: float, signal_result, svix_closes: list[float] | None = None) -> dict:
     """Called once per fast-loop cycle (loop_svix_exit_monitor.py) while
     this campaign might hold a position. Reconciles pending orders first,
     then evaluates the tiered exit response against `signal_result`
     (a monitor.vix_leading_signals.LeadingSignalResult), then submits a
-    flatten if warranted and none is already in flight. `dry_run` is
-    intentionally not offered here -- reconcile_pending_orders() only acts
-    on orders this same module previously submitted for real, so there's
-    nothing to preview; callers wanting a dry run should not call this at
-    all (see loop_svix_exit_monitor.py's --dry-run handling).
+    flatten if warranted and none is already in flight. `svix_closes` is
+    this campaign's own recent SVIX daily closes (oldest first, from
+    vix_signals.fetch_ticker_history) -- used only for RIDE MODE's
+    momentum / near-high checks; passing None just means ride mode can
+    never engage this cycle (fail closed). `dry_run` is intentionally not
+    offered here -- reconcile_pending_orders() only acts on orders this
+    same module previously submitted for real, so there's nothing to
+    preview; callers wanting a dry run should not call this at all (see
+    loop_svix_exit_monitor.py's --dry-run handling).
 
     Returns a status dict for the caller's alerting/dashboard-cache logic:
-    action is one of "none" (nothing to do), "armed" (a stop was just armed
-    for the first time, level 1 or 2), "tightened" (an already-armed stop
-    just ratcheted closer to price), "flatten_submitted",
-    "flatten_in_progress" (a sell is already pending from a prior cycle),
-    or "flatten_failed" (order submission itself raised -- see
-    detail.skip_reason).
+    action is one of "none", "armed" (a tight stop just armed for the first
+    time), "tightened" (an armed tight stop ratcheted closer), "ride_started"
+    (ride mode just engaged -- tight stop cleared, wide trailing exit now in
+    force), "ride_ended" (momentum decayed -- back to the tight-stop
+    regime), "flatten_submitted", "flatten_in_progress", or "flatten_failed".
+    On a flatten, "flatten_reason" is one of "tier3", "tight_stop",
+    "ride_rollover".
     """
     reconcile_pending_orders(client)
     state = _load_state()
@@ -396,11 +454,35 @@ def run_exit_cycle(client, live_price: float, signal_result) -> dict:
     if shares <= 0:
         return {"action": "none", "shares_remaining": 0, "armed_stop": state["armed_stop"]}
 
+    avg_cost = _avg_cost_per_share(state)
+    unreal_pct = (live_price - avg_cost) / avg_cost if avg_cost else 0.0
     need_flatten = False
     stop_action = None
+    flatten_reason = None
 
     if signal_result.exit_level >= 3:
-        need_flatten = True
+        need_flatten = True                              # tier 3 = absolute override, BOTH regimes
+        flatten_reason = "tier3"
+    elif ENABLE_SVIX_MANUAL_RIDE and state.get("ride_mode"):
+        # RIDE MODE: tier-1 AND tier-2 stops fully suspended. The only
+        # protection besides tier 3 is a wide trailing exit off the
+        # ride-peak. See module docstring / config.py.
+        peak = max(state.get("ride_peak") or live_price, live_price)
+        state["ride_peak"] = peak
+        _save_state(state)
+        trail = round(peak * (1 - SVIX_MANUAL_RIDE_TRAIL_PCT), 4)
+        momentum = _ride_momentum(svix_closes, SVIX_MANUAL_RIDE_SESSIONS)
+        if live_price <= trail:
+            need_flatten = True
+            flatten_reason = "ride_rollover"
+        elif momentum is not None and momentum < SVIX_MANUAL_RIDE_EXIT_MOMENTUM_PCT:
+            # Momentum fizzled without hitting an exit -> snap back to the
+            # tight-stop regime. armed_stop stays None; the next cycle's
+            # tier-1/2 branch re-arms it fresh at that cycle's price.
+            state["ride_mode"] = False
+            state["ride_peak"] = None
+            _save_state(state)
+            stop_action = "ride_ended"
     else:
         stop_pct = {1: SVIX_MANUAL_TIER1_STOP_PCT, 2: SVIX_MANUAL_STOP_PCT}.get(signal_result.exit_level)
         if stop_pct is not None:
@@ -425,15 +507,37 @@ def run_exit_cycle(client, live_price: float, signal_result) -> dict:
         state = _load_state()
         if state["armed_stop"] is not None and live_price <= state["armed_stop"]:
             need_flatten = True
+            flatten_reason = "tight_stop"
+
+        # RIDE-MODE ENTRY -- pure SVIX price action (his call 2026-09-07):
+        # momentum + near-highs + green position. Can engage even while
+        # tier-2 compression is confirmed. Clears the tight stop on the way in.
+        if ENABLE_SVIX_MANUAL_RIDE and not need_flatten and svix_closes:
+            momentum = _ride_momentum(svix_closes, SVIX_MANUAL_RIDE_SESSIONS)
+            near_high = _ride_near_high(
+                svix_closes, live_price, SVIX_MANUAL_RIDE_SESSIONS, SVIX_MANUAL_RIDE_NEAR_HIGH_BUF
+            )
+            if (momentum is not None and momentum >= SVIX_MANUAL_RIDE_MOMENTUM_PCT
+                    and near_high and unreal_pct >= SVIX_MANUAL_RIDE_MIN_PNL_PCT):
+                state["ride_mode"] = True
+                state["ride_peak"] = live_price
+                state["armed_stop"] = None
+                _save_state(state)
+                stop_action = "ride_started"
 
     if not need_flatten:
-        if stop_action is not None:
-            return {"action": stop_action, "shares_remaining": shares, "armed_stop": state["armed_stop"]}
-        return {"action": "none", "shares_remaining": shares, "armed_stop": state["armed_stop"]}
+        base = {
+            "action": stop_action or "none", "shares_remaining": shares,
+            "armed_stop": state["armed_stop"], "ride_mode": state.get("ride_mode", False),
+            "ride_peak": state.get("ride_peak"),
+        }
+        return base
 
     if has_pending_sell:
-        return {"action": "flatten_in_progress", "shares_remaining": shares, "armed_stop": state["armed_stop"]}
+        return {"action": "flatten_in_progress", "shares_remaining": shares,
+                "armed_stop": state["armed_stop"], "flatten_reason": flatten_reason}
 
     result = submit_flatten(client, shares)
     action = "flatten_submitted" if result.get("executed") else "flatten_failed"
-    return {"action": action, "detail": result, "shares_remaining": shares, "armed_stop": state["armed_stop"]}
+    return {"action": action, "detail": result, "shares_remaining": shares,
+            "armed_stop": state["armed_stop"], "flatten_reason": flatten_reason}

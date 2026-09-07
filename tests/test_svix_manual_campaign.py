@@ -24,7 +24,20 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(smc, "SVIX_MANUAL_BUDGET_DOLLARS", 9000)  # 3 rungs @ $3k
     monkeypatch.setattr(smc, "SVIX_MANUAL_STOP_PCT", 0.05)
     monkeypatch.setattr(smc, "SVIX_MANUAL_TIER1_STOP_PCT", 0.10)
+    monkeypatch.setattr(smc, "ENABLE_SVIX_MANUAL_RIDE", True)
+    monkeypatch.setattr(smc, "SVIX_MANUAL_RIDE_SESSIONS", 5)
+    monkeypatch.setattr(smc, "SVIX_MANUAL_RIDE_MOMENTUM_PCT", 0.08)
+    monkeypatch.setattr(smc, "SVIX_MANUAL_RIDE_NEAR_HIGH_BUF", 0.02)
+    monkeypatch.setattr(smc, "SVIX_MANUAL_RIDE_MIN_PNL_PCT", 0.05)
+    monkeypatch.setattr(smc, "SVIX_MANUAL_RIDE_EXIT_MOMENTUM_PCT", 0.02)
+    monkeypatch.setattr(smc, "SVIX_MANUAL_RIDE_TRAIL_PCT", 0.07)
     return state_file
+
+
+# oldest-first SVIX closes: +20% over the trailing 5 sessions, price at the high
+RIDE_CLOSES_TRENDING = [20.0, 20.0, 21.0, 22.0, 23.0, 24.0]
+# flat: ~0% over the trailing 5 sessions
+RIDE_CLOSES_FLAT = [24.0, 24.0, 24.0, 24.1, 24.0, 24.0]
 
 
 class FakeOrder:
@@ -403,3 +416,111 @@ def test_run_exit_cycle_resubmits_after_rejected_flatten(isolated_state):
     result = smc.run_exit_cycle(client, 19.8, _fake_signal(exit_level=3))
     assert result["action"] == "flatten_submitted"
     assert len(client.submitted) == 2  # resubmitted
+
+
+# ── run_exit_cycle: RIDE MODE ──────────────────────────────────────────
+
+def test_ride_mode_engages_on_momentum_near_high_and_green(isolated_state):
+    smc._record_lot(20.0, 100, 20.0)  # cost 20
+    client = FakeClient()
+    result = smc.run_exit_cycle(client, 24.0, _fake_signal(exit_level=0), svix_closes=RIDE_CLOSES_TRENDING)
+    assert result["action"] == "ride_started"
+    state = smc._load_state()
+    assert state["ride_mode"] is True
+    assert state["ride_peak"] == 24.0
+    assert state["armed_stop"] is None  # tight stop cleared on the way in
+    assert client.submitted == []
+
+
+def test_ride_mode_does_not_engage_when_position_red(isolated_state):
+    smc._record_lot(25.0, 100, 25.0)  # cost 25 -> at price 24 the position is -4%
+    client = FakeClient()
+    result = smc.run_exit_cycle(client, 24.0, _fake_signal(exit_level=0), svix_closes=RIDE_CLOSES_TRENDING)
+    assert result["action"] == "none"
+    assert smc._load_state()["ride_mode"] is False
+
+
+def test_ride_mode_does_not_engage_without_svix_closes(isolated_state):
+    smc._record_lot(20.0, 100, 20.0)
+    client = FakeClient()
+    result = smc.run_exit_cycle(client, 24.0, _fake_signal(exit_level=0), svix_closes=None)
+    assert result["action"] == "none"
+    assert smc._load_state()["ride_mode"] is False
+
+
+def test_ride_mode_engages_even_while_tier2_compression_confirmed(isolated_state):
+    smc._record_lot(20.0, 100, 20.0)
+    client = FakeClient()
+    result = smc.run_exit_cycle(client, 24.0, _fake_signal(exit_level=2), svix_closes=RIDE_CLOSES_TRENDING)
+    assert result["action"] == "ride_started"
+    assert smc._load_state()["armed_stop"] is None
+
+
+def test_ride_mode_suspends_tight_stop_no_flatten_on_small_dip(isolated_state):
+    smc._record_lot(20.0, 100, 20.0)
+    client = FakeClient()
+    smc.run_exit_cycle(client, 24.0, _fake_signal(exit_level=2), svix_closes=RIDE_CLOSES_TRENDING)  # ride on, peak 24
+    # price dips to 23 -- a >3% drop that the old tier-2 stop would have caught,
+    # but 23 > 24*0.93 = 22.32, so ride mode holds
+    result = smc.run_exit_cycle(client, 23.0, _fake_signal(exit_level=2), svix_closes=RIDE_CLOSES_TRENDING)
+    assert result["action"] == "none"
+    assert client.submitted == []
+    assert smc._load_state()["ride_mode"] is True
+
+
+def test_ride_mode_flattens_on_trailing_exit_off_peak(isolated_state):
+    smc._record_lot(20.0, 100, 20.0)
+    client = FakeClient()
+    smc.run_exit_cycle(client, 24.0, _fake_signal(exit_level=0), svix_closes=RIDE_CLOSES_TRENDING)  # peak 24
+    smc.run_exit_cycle(client, 26.0, _fake_signal(exit_level=0), svix_closes=RIDE_CLOSES_TRENDING)  # peak ratchets to 26
+    assert smc._load_state()["ride_peak"] == 26.0
+    # 26 * 0.93 = 24.18 -> a drop to 24.0 rolls over
+    result = smc.run_exit_cycle(client, 24.0, _fake_signal(exit_level=0), svix_closes=RIDE_CLOSES_TRENDING)
+    assert result["action"] == "flatten_submitted"
+    assert result["flatten_reason"] == "ride_rollover"
+
+
+def test_ride_mode_tier3_still_flattens(isolated_state):
+    smc._record_lot(20.0, 100, 20.0)
+    client = FakeClient()
+    smc.run_exit_cycle(client, 24.0, _fake_signal(exit_level=0), svix_closes=RIDE_CLOSES_TRENDING)
+    result = smc.run_exit_cycle(client, 25.0, _fake_signal(exit_level=3), svix_closes=RIDE_CLOSES_TRENDING)
+    assert result["action"] == "flatten_submitted"
+    assert result["flatten_reason"] == "tier3"
+
+
+def test_ride_mode_snaps_back_when_momentum_fades(isolated_state):
+    smc._record_lot(20.0, 100, 20.0)
+    client = FakeClient()
+    smc.run_exit_cycle(client, 24.0, _fake_signal(exit_level=0), svix_closes=RIDE_CLOSES_TRENDING)
+    # momentum now ~0 over the trailing window, price still well above the trail
+    result = smc.run_exit_cycle(client, 24.0, _fake_signal(exit_level=0), svix_closes=RIDE_CLOSES_FLAT)
+    assert result["action"] == "ride_ended"
+    state = smc._load_state()
+    assert state["ride_mode"] is False
+    assert state["ride_peak"] is None
+    assert state["armed_stop"] is None  # re-arms on a later tier-1/2 cycle
+    assert client.submitted == []
+
+
+def test_ride_state_resets_on_full_exit(isolated_state):
+    smc._record_lot(20.0, 100, 20.0)
+    client = FakeClient()
+    smc.run_exit_cycle(client, 24.0, _fake_signal(exit_level=0), svix_closes=RIDE_CLOSES_TRENDING)
+    smc.run_exit_cycle(client, 25.0, _fake_signal(exit_level=3), svix_closes=RIDE_CLOSES_TRENDING)  # flatten
+    order_id = smc._load_state()["pending_orders"][0]["order_id"]
+    client.set_status(order_id, "filled", filled_qty=100, filled_avg_price=25.0)
+    smc.reconcile_pending_orders(client)
+    state = smc._load_state()
+    assert smc._current_shares(state) == 0
+    assert state["ride_mode"] is False
+    assert state["ride_peak"] is None
+
+
+def test_ride_mode_disabled_by_flag_keeps_tight_stop(isolated_state, monkeypatch):
+    monkeypatch.setattr(smc, "ENABLE_SVIX_MANUAL_RIDE", False)
+    smc._record_lot(20.0, 100, 20.0)
+    client = FakeClient()
+    result = smc.run_exit_cycle(client, 24.0, _fake_signal(exit_level=2), svix_closes=RIDE_CLOSES_TRENDING)
+    assert result["action"] == "armed"  # normal tier-2 stop, no ride mode
+    assert smc._load_state()["ride_mode"] is False

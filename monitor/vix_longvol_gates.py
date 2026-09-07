@@ -22,9 +22,11 @@ Gate A — cheap floor (REQUIRED): VIX below the VIX_LONGVOL_CHEAP_PERCENTILE
   win rate (67%->61% in backtest) for meaningfully more opportunities
   (18->28 signals) and actually being able to fire in the current regime.
 
-Gate B — term structure flattening: today's live VIX/VIX3M ratio compared
-  to the ratio VIX_LONGVOL_LOOKBACK_SESSIONS sessions ago, confirming if it
-  has DECREASED (curve compressing toward backwardation). Uses VIX/VIX3M,
+Gate B — term structure: today's live VIX/VIX3M ratio compared to the
+  ratio VIX_LONGVOL_LOOKBACK_SESSIONS sessions ago, confirming if it has
+  DECREASED (the curve has STEEPENED into deeper contango — read here as a
+  contrarian complacency precursor; see term_structure_gate()'s own
+  docstring for the direction note and the two callers). Uses VIX/VIX3M,
   not VX1/VX2 futures, because UW_HAS_CME_FUTURES=false on this account
   tier — no futures data is actually available live (same fallback
   monitor/vix_regime.py already uses). The "N sessions ago" side comes from
@@ -121,13 +123,25 @@ def term_structure_gate(
     vix_now: float | None, vix3m_now: float | None,
     lookback_sessions: int | None = None, min_pct: float | None = None,
 ) -> bool:
-    """Gate B: VIX/VIX3M ratio has fallen by at least `min_pct` of its
-    value `lookback_sessions` ago (curve flattening/compressing toward
-    backwardation — an early-warning precursor rather than requiring
-    outright backwardation already, which would mean the move already
-    happened). min_pct=0.0 (the original definition) confirms on any
-    decrease at all -- backtesting 2026-08-25 found that too loose, firing
-    on essentially any wiggle in the ratio."""
+    """True when the VIX/VIX3M ratio has FALLEN by at least `min_pct`
+    versus its value `lookback_sessions` ago.
+
+    Direction note (corrected 2026-09-07): a falling VIX/VIX3M ratio is the
+    curve STEEPENING into deeper contango — VIX dropping faster than VIX3M —
+    i.e. moving AWAY from backwardation, not toward it. Earlier docstrings
+    (and the name "term_structure_gate") described the opposite; the code
+    has always done this. Two callers rely on that behavior:
+      - LONG_VOL_TACTICAL Gate B (entry): reads a sharp contango-steepening
+        as a contrarian complacency / mean-reversion precursor. Backtested
+        to positive win rate 2026-08-25 as part of the A-required scoring.
+      - vix_leading_signals tier 3 (SVIX manual EXIT): reads the same
+        condition as run-up exhaustion — SVIX has spiked up fast, take
+        profit. Verified load-bearing 2026-09-07 (backtest_svix_manual.py
+        --tier3-compare).
+
+    min_pct=0.0 (the original definition) confirms on any decrease at all --
+    backtesting 2026-08-25 found that too loose, firing on essentially any
+    wiggle in the ratio."""
     if not vix_now or not vix3m_now:
         return False
     lookback_sessions = lookback_sessions if lookback_sessions is not None else VIX_LONGVOL_LOOKBACK_SESSIONS
