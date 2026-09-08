@@ -192,6 +192,46 @@ SVIX_MANUAL_TIER1_STOP_PCT = float(os.getenv("SVIX_MANUAL_TIER1_STOP_PCT", 0.05)
 SVIX_MANUAL_STATE_FILE = VIX_DATA_DIR / "svix_manual_state.json"
 SVIX_MANUAL_CACHE_FILE = VIX_DATA_DIR / "svix_manual_cache.json"
 
+# ── SVIX manual campaign — realized-correlation COMPRESSION early warning ──
+# (wired live 2026-09-08). An additional tier-1-level exit arm (arms the
+# WIDE stop, OR'd with the VVIX/VIX divergence tier 1) that fires when the
+# SVIX_CORR_WINDOW-day equal-weight average pairwise realized correlation of
+# a fixed large-cap basket sits in the bottom SVIX_CORR_PERCENTILE-th
+# percentile of its own trailing SVIX_CORR_LOOKBACK_YEARS -- extreme
+# short-vol complacency / dispersion crowding, which historically leads a
+# VIX spike by ~2-4 weeks.
+#
+# Stage-1 signal diagnostic + Stage-2 campaign backtest, 2026-09-08
+# (scratch corr_vs_vvix_*.py; backtest_svix_manual.py --corr-compression /
+# --corr-compare): at the 5th percentile the 21d signal led VIX +15%/20d
+# and SVIX -14% max-drawdown/20d (base -1.7% / -6.9%), robust ex-2020, and
+# fired 10 days before the Feb-2025 tariff selloff -- a setup the VVIX/VIX
+# compression tier (tier 2) missed. The 15th-pct threshold does NOT work
+# (~base rate) -- it needs the tail. tier 2 is KEPT (complementary slower
+# 40-60d-horizon edge); this is an added arm, not a replacement. In the
+# campaign backtest the delta is small (tier 3 does ~77% of exits and the
+# rung entries dodge the pre-spike window) -- the real value is a live
+# warning that protects discretionary above-rung entries.
+#
+# Computed once per trading day and cached (SVIX_CORR_STATE_FILE): the fast
+# exit loop reads the cache; the first call of a new day recomputes (one
+# yfinance batch fetch + correlation math). Fail closed (compressed=False)
+# on any fetch failure or a cache older than SVIX_CORR_STALE_DAYS.
+ENABLE_SVIX_CORR_COMPRESSION = os.getenv("ENABLE_SVIX_CORR_COMPRESSION", "true").lower() == "true"
+SVIX_CORR_WINDOW = int(os.getenv("SVIX_CORR_WINDOW", 21))
+SVIX_CORR_PERCENTILE = float(os.getenv("SVIX_CORR_PERCENTILE", 5))
+SVIX_CORR_LOOKBACK_YEARS = float(os.getenv("SVIX_CORR_LOOKBACK_YEARS", 2))
+SVIX_CORR_STALE_DAYS = int(os.getenv("SVIX_CORR_STALE_DAYS", 5))
+SVIX_CORR_STATE_FILE = VIX_DATA_DIR / "corr_compression_state.json"
+# Fixed top-~28 S&P 500 names by weight. Membership drift is irrelevant for
+# a correlation LEVEL estimate (his call 2026-09-08: use a fixed set).
+# BRK-B uses yfinance's dash form.
+SVIX_CORR_BASKET = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK-B", "LLY", "AVGO", "TSLA",
+    "JPM", "WMT", "V", "XOM", "UNH", "MA", "PG", "JNJ", "HD", "COST",
+    "ORCL", "ABBV", "BAC", "KO", "NFLX", "CVX", "CRM", "AMD",
+]
+
 # ── SVIX manual campaign — RIDE MODE (wired live 2026-09-07) ──────────────
 # A second exit regime for when SVIX is trending up hard and the tight
 # tier-1/tier-2 stop keeps chopping the position out before the post-spike

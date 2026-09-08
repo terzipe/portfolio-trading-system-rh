@@ -175,13 +175,15 @@ def isolated_leading_state(tmp_path, monkeypatch):
     return state_file
 
 
-def _patch_evaluate_deps(monkeypatch, tier1, tier2, tier3, tier4):
+def _patch_evaluate_deps(monkeypatch, tier1, tier2, tier3, tier4, corr=False):
     monkeypatch.setattr(vix_leading_signals, "fetch_dated_series", lambda *a, **k: [(date.today(), 1.0), (date.today(), 2.0)])
     monkeypatch.setattr(vix_leading_signals, "_yf_closes", lambda *a, **k: [1.0, 2.0])
     monkeypatch.setattr(vix_leading_signals, "divergence_gate", lambda *a, **k: tier1)
     monkeypatch.setattr(vix_leading_signals, "compression_gate", lambda *a, **k: tier2)
     monkeypatch.setattr(vix_leading_signals, "term_structure_gate", lambda *a, **k: tier3)
     monkeypatch.setattr(vix_leading_signals, "skew_confirmer_gate", lambda *a, **k: tier4)
+    monkeypatch.setattr(vix_leading_signals.corr_compression, "get_status",
+                        lambda **k: {"compressed": corr, "percentile": 3.0 if corr else 55.0})
 
 
 DAY1 = date(2026, 1, 5)
@@ -206,6 +208,29 @@ def test_evaluate_exit_level_2_on_tier2_only(isolated_leading_state, monkeypatch
     _patch_evaluate_deps(monkeypatch, False, True, False, False)
     result = vix_leading_signals.evaluate(15.0, 18.0, today=DAY1)
     assert result.exit_level == 2
+
+
+def test_evaluate_exit_level_1_on_corr_compression_only(isolated_leading_state, monkeypatch):
+    _patch_evaluate_deps(monkeypatch, False, False, False, False, corr=True)
+    result = vix_leading_signals.evaluate(15.0, 18.0, today=DAY1)
+    assert result.exit_level == 1
+    assert result.corr_compression is True
+    assert result.corr_percentile == 3.0
+    assert result.score == 0  # corr compression does not count toward the 0-3 score
+
+
+def test_evaluate_tier2_still_wins_when_corr_compression_also_confirmed(isolated_leading_state, monkeypatch):
+    _patch_evaluate_deps(monkeypatch, False, True, False, False, corr=True)
+    result = vix_leading_signals.evaluate(15.0, 18.0, today=DAY1)
+    assert result.exit_level == 2  # tier 2 (tight stop) outranks the tier-1-level corr arm
+
+
+def test_evaluate_corr_compression_disabled_by_flag(isolated_leading_state, monkeypatch):
+    monkeypatch.setattr(vix_leading_signals, "ENABLE_SVIX_CORR_COMPRESSION", False)
+    _patch_evaluate_deps(monkeypatch, False, False, False, False, corr=True)
+    result = vix_leading_signals.evaluate(15.0, 18.0, today=DAY1)
+    assert result.exit_level == 0
+    assert result.corr_compression is False
 
 
 def test_evaluate_exit_level_2_wins_over_tier1_when_both_confirmed(isolated_leading_state, monkeypatch):

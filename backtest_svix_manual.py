@@ -119,6 +119,42 @@ def _wilder_atr(ohlc: pd.DataFrame, window: int) -> pd.Series:
     return true_range.ewm(alpha=1.0 / window, adjust=False).mean()
 
 
+_CORR_CACHE: dict = {}
+
+
+def realized_corr_pct_series(window: int, lookback_years: float) -> pd.Series:
+    """Day-indexed percentile rank (0-100) of the trailing `window`-day
+    equal-weight average pairwise realized correlation of config.
+    SVIX_CORR_BASKET, ranked against its own trailing `lookback_years` of
+    daily readings. Low = compressed. Same 'realized correlation' the live
+    monitor/corr_compression.py computes, vectorized over history (this
+    file re-implements signal math rather than importing the live path --
+    see module docstring)."""
+    key = (window, lookback_years)
+    if key in _CORR_CACHE:
+        return _CORR_CACHE[key]
+    px = yf.download(config.SVIX_CORR_BASKET, period="10y", interval="1d",
+                     progress=False, auto_adjust=True)["Close"]
+    px = px.dropna(axis=1, how="all").dropna(how="any")
+    px.index = pd.to_datetime(px.index).tz_localize(None)
+    rets = np.log(px).diff().dropna()
+    arr, idx, n = rets.values, rets.index, rets.shape[1]
+    denom = n * (n - 1)
+    rc = pd.Series(
+        {idx[i]: (np.nansum(np.corrcoef(arr[i - window:i].T)) - n) / denom
+         for i in range(window, len(arr))}
+    )
+    hist_days = int(lookback_years * 252)
+
+    def _rank(a: np.ndarray) -> float:
+        today = a[-1]
+        return np.nan if np.isnan(today) else (a <= today).sum() / len(a) * 100
+
+    pct = rc.rolling(hist_days, min_periods=hist_days // 4).apply(_rank, raw=True)
+    _CORR_CACHE[key] = pct
+    return pct
+
+
 def _val(series: pd.Series, key) -> float | None:
     """series.get(key), returning None for missing / NaN (fail closed)."""
     try:
@@ -185,7 +221,9 @@ def build_signal_frame(sessions: int, divergence_min_pp: float, compression_wind
                         compression_pct: float, compression_history_years: float,
                         term_sessions: int, term_min_pct: float,
                         skew_sessions: int, skew_min_pct: float,
-                        tier3_confirm_days: int = 1, tier3_mode: str = "fall") -> pd.DataFrame:
+                        tier3_confirm_days: int = 1, tier3_mode: str = "fall",
+                        corr_compression: bool = False, corr_window: int | None = None,
+                        corr_pct: float | None = None, corr_lookback_years: float | None = None) -> pd.DataFrame:
     """tier3_mode selects what "term structure = exit" means:
       "fall"          — as-built: VIX/VIX3M ratio fell >= term_min_pct over
                         term_sessions (reuses vix_longvol_gates.term_
@@ -256,14 +294,27 @@ def build_signal_frame(sessions: int, divergence_min_pp: float, compression_wind
     skew_chg = df["skew"].pct_change(skew_sessions)
     df["tier4"] = skew_chg >= skew_min_pct
 
+    # realized-correlation compression -- a tier-1-level arm (OR'd with the
+    # divergence tier 1), NOT a replacement for tier 2. See config.py's
+    # SVIX_CORR_* block.
+    if corr_compression:
+        cw = corr_window if corr_window is not None else config.SVIX_CORR_WINDOW
+        cp = corr_pct if corr_pct is not None else config.SVIX_CORR_PERCENTILE
+        cly = corr_lookback_years if corr_lookback_years is not None else config.SVIX_CORR_LOOKBACK_YEARS
+        rc_pct = realized_corr_pct_series(cw, cly).reindex(df.index, method="ffill")
+        df["corr_compressed"] = (rc_pct <= cp).fillna(False)
+    else:
+        df["corr_compressed"] = False
+
     df[["tier1", "tier2", "tier3", "tier4"]] = df[["tier1", "tier2", "tier3", "tier4"]].fillna(False)
-    df["exit_level"] = np.where(df["tier3"], 3, np.where(df["tier2"], 2, np.where(df["tier1"], 1, 0)))
+    tier1_or_corr = df["tier1"] | df["corr_compressed"]
+    df["exit_level"] = np.where(df["tier3"], 3, np.where(df["tier2"], 2, np.where(tier1_or_corr, 1, 0)))
     return df
 
 
 def run_backtest(nav: float, stop_pct: float | None = None, signal_df: pd.DataFrame | None = None,
                   tier3_confirm_days: int | None = None, tier1_stop_pct: float | None = None,
-                  ride: dict | None = None, tier3_mode: str = "fall") -> dict:
+                  ride: dict | None = None, tier3_mode: str = "fall", corr_compression: bool = False) -> dict:
     stop_pct = stop_pct if stop_pct is not None else config.SVIX_MANUAL_STOP_PCT
     tier1_stop_pct = tier1_stop_pct if tier1_stop_pct is not None else config.SVIX_MANUAL_TIER1_STOP_PCT
     tier3_confirm_days = tier3_confirm_days if tier3_confirm_days is not None else config.VIX_LEADING_TIER3_CONFIRM_DAYS
@@ -291,6 +342,7 @@ def run_backtest(nav: float, stop_pct: float | None = None, signal_df: pd.DataFr
             term_sessions=config.VIX_LEADING_TERM_STRUCTURE_SESSIONS, term_min_pct=config.VIX_LEADING_TERM_STRUCTURE_MIN_PCT,
             skew_sessions=config.VIX_LEADING_SKEW_SESSIONS, skew_min_pct=config.VIX_LEADING_SKEW_MIN_PCT,
             tier3_confirm_days=tier3_confirm_days, tier3_mode=tier3_mode,
+            corr_compression=corr_compression,
         )
     signal_on_svix = signal_df.reindex(svix.index, method="ffill")
 
@@ -670,6 +722,10 @@ if __name__ == "__main__":
                         help="What 'term structure = exit' means (see build_signal_frame). Default 'fall' = as-built.")
     parser.add_argument("--tier3-compare", action="store_true", dest="tier3_compare",
                         help="Run all four tier3 modes (x ride off/on) side by side and stop.")
+    parser.add_argument("--corr-compression", action="store_true", dest="corr_compression",
+                        help="Add realized-correlation compression (config.SVIX_CORR_*) as a tier-1 arm.")
+    parser.add_argument("--corr-compare", action="store_true", dest="corr_compare",
+                        help="Baseline / +corr-compression / +ride / +corr+ride side by side and stop.")
     parser.add_argument(
         "--tier3-confirm-days", type=int, default=None, dest="tier3_confirm_days",
         help="Require tier 3 (term structure) confirmed on this many CONSECUTIVE sessions before flattening "
@@ -690,6 +746,23 @@ if __name__ == "__main__":
                 wsh = min((m["shadow_unrealized_pct"] for m in marks if m["shadow_unrealized_pct"] is not None), default=0)
                 print(f"{mode:14s} {'on' if ride else 'off':5s} "
                       f"${sum(t['realized_pnl'] for t in sells):>10,.0f} {dim:>11.0%} {ws:>10.1%} {ws - wsh:>+8.1%}")
+    elif args.corr_compare:
+        print(f"\n  realized-corr compression = 21d avg pairwise corr of {len(config.SVIX_CORR_BASKET)} "
+              f"large caps, <= {config.SVIX_CORR_PERCENTILE:g}th pct of trailing {config.SVIX_CORR_LOOKBACK_YEARS:g}y")
+        print(f"\n  {'config':26s}{'realized':>12s}{'time_in_mkt':>13s}{'worst_mark':>12s}{'avoided':>10s}{'corr exits':>12s}")
+        for label, kw in [
+            ("baseline", {}),
+            ("+corr-compression", {"corr_compression": True}),
+            ("+ride", {"ride": _default_ride_params()}),
+            ("+corr +ride", {"corr_compression": True, "ride": _default_ride_params()}),
+        ]:
+            r = run_backtest(args.nav, **kw)
+            marks, sells = r["daily_marks"], [t for t in r["trade_log"] if t["action"] == "SELL"]
+            dim = sum(1 for m in marks if m["shares"] > 0) / len(marks)
+            ws = min((m["unrealized_pnl_pct"] for m in marks if m["unrealized_pnl_pct"] is not None), default=0)
+            wsh = min((m["shadow_unrealized_pct"] for m in marks if m["shadow_unrealized_pct"] is not None), default=0)
+            n_corr = sum(1 for t in sells if t.get("reason") == "tight_stop")  # tier-1/2 stop exits (proxy)
+            print(f"  {label:26s}${sum(t['realized_pnl'] for t in sells):>11,.0f}{dim:>12.0%}{ws:>11.1%}{ws - wsh:>+9.1%}{n_corr:>12d}")
     elif args.ride_sweep:
         run_ride_sweep(args.nav)
     elif args.sweep:
@@ -698,7 +771,9 @@ if __name__ == "__main__":
         ride = _default_ride_params() if args.ride else None
         if ride is not None:
             print("\n--- BASELINE (ride OFF) ---")
-            summarize(run_backtest(args.nav, tier3_confirm_days=args.tier3_confirm_days, tier3_mode=args.tier3_mode))
+            summarize(run_backtest(args.nav, tier3_confirm_days=args.tier3_confirm_days,
+                                   tier3_mode=args.tier3_mode, corr_compression=args.corr_compression))
             print("\n--- RIDE MODE ON (_default_ride_params) ---")
-        result = run_backtest(args.nav, tier3_confirm_days=args.tier3_confirm_days, ride=ride, tier3_mode=args.tier3_mode)
+        result = run_backtest(args.nav, tier3_confirm_days=args.tier3_confirm_days, ride=ride,
+                              tier3_mode=args.tier3_mode, corr_compression=args.corr_compression)
         summarize(result)

@@ -14,6 +14,19 @@ priority order:
   Tier 1 — VVIX/VIX divergence (best single leading signal): VVIX rising
     while VIX is flat/down. Informed flow hits VIX options before the
     headline VIX moves.
+  Tier 1b — realized-correlation COMPRESSION (added 2026-09-08,
+    monitor/corr_compression.py): 21d avg pairwise realized correlation of a
+    fixed large-cap basket in the bottom 5th percentile of its trailing 2y
+    = extreme short-vol complacency / dispersion crowding. Arguably an
+    EARLIER precursor than VIX itself (VIX only moves once correlation
+    starts breaking). OR'd with tier 1 — same WIDE-stop response.
+    Stage-1/Stage-2 evidence 2026-09-08: strong as a pure spike predictor
+    at the 5th pct (led VIX +15%/20d, SVIX -14% max-dd/20d; caught the
+    Feb-2025 setup tier 2 missed), but only marginally negative in the
+    campaign backtest (-$860, no drawdown change) because tier 3 front-runs
+    the early tiers and the rung entries dodge the pre-spike window. Wired
+    anyway for its live value on discretionary above-rung entries the
+    backtest can't model.
   Tier 2 — VIX + VVIX range compression ("coiled spring"): unusually low
     20-day dispersion in EITHER series precedes spikes more reliably than a
     simply "low" VIX level does (Thrasher). "Combined compression of both
@@ -41,13 +54,14 @@ to come from data/fred.py, matching the rest of this codebase.
 
 exit_level mapping (svix_manual_campaign.py's exit-response logic):
   0 — nothing confirmed
-  1 — tier 1 (divergence) confirmed — arm a WIDE resting stop
-      (config.SVIX_MANUAL_TIER1_STOP_PCT). Wired live 2026-08-29 — tier 1
-      is the earliest/least-confirmed signal in his priority ordering, so
-      it gets the loosest response, not a flatten. The stop only ever
-      ratchets TIGHTER (closer to price) as a stronger tier confirms or
-      price falls further — a level-1-armed stop is never widened back out
-      by a later level-1-only reading, see run_exit_cycle()'s docstring.
+  1 — tier 1 (divergence) OR tier 1b (realized-corr compression) confirmed —
+      arm a WIDE resting stop (config.SVIX_MANUAL_TIER1_STOP_PCT). Wired
+      live 2026-08-29 (tier 1) / 2026-09-08 (tier 1b) — the earliest,
+      least-confirmed signals, so they get the loosest response, not a
+      flatten. The stop only ever ratchets TIGHTER (closer to price) as a
+      stronger tier confirms or price falls further — a level-1-armed stop
+      is never widened back out by a later level-1-only reading, see
+      run_exit_cycle()'s docstring.
   2 — tier 2 (compression) confirmed — arm/tighten the resting stop to
       config.SVIX_MANUAL_STOP_PCT (tighter than tier 1's)
   3 — tier 3 (run-up-exhaustion take-profit) confirmed on
@@ -96,9 +110,14 @@ from config import (
     VIX_LEADING_SKEW_MIN_PCT,
     VIX_LEADING_TIER3_CONFIRM_DAYS,
     VIX_LEADING_STATE_FILE,
+    ENABLE_SVIX_CORR_COMPRESSION,
+    SVIX_CORR_WINDOW,
+    SVIX_CORR_PERCENTILE,
+    SVIX_CORR_LOOKBACK_YEARS,
 )
 from data.fred import fetch_dated_series, VIXCLS
 from monitor.vix_longvol_gates import term_structure_gate
+from monitor import corr_compression
 
 
 @dataclass
@@ -109,7 +128,9 @@ class LeadingSignalResult:
     tier4_skew_confirmer: bool
     tier3_confirmed_days: int  # consecutive trading days tier3 has read confirmed, including today
     score: int  # count of tier1-3 confirmed (tier3 counts on today's raw reading); tier4 never counted (confirmer only)
-    exit_level: int  # 0 = none, 2 = arm stop, 3 = full flatten (tier3 sustained VIX_LEADING_TIER3_CONFIRM_DAYS)
+    exit_level: int  # 0 = none, 1 = arm wide stop, 2 = arm tight stop, 3 = full flatten (tier3 sustained)
+    corr_compression: bool = False   # realized-correlation compression (monitor/corr_compression.py) -- a tier-1-level arm, OR'd with tier1
+    corr_percentile: float | None = None  # the realized-corr level's percentile vs its trailing lookback (for the dashboard)
     reasons: list[str] = field(default_factory=list)
 
 
@@ -302,7 +323,25 @@ def evaluate(
     tier3_confirmed_days = _update_tier3_streak(tier3, today=today, dry_run=dry_run)
     tier4 = skew_confirmer_gate(skew_closes) if skew_closes else False
 
+    # realized-correlation compression -- a tier-1-level arm (OR'd with the
+    # divergence tier 1 below). Own daily-TTL cache; fails closed. See
+    # monitor/corr_compression.py and config.py's SVIX_CORR_* block.
+    corr_compressed = False
+    corr_pct = None
+    if ENABLE_SVIX_CORR_COMPRESSION:
+        try:
+            _corr = corr_compression.get_status(dry_run=dry_run)
+            corr_compressed = bool(_corr.get("compressed"))
+            corr_pct = _corr.get("percentile")
+        except Exception as exc:  # noqa: BLE001 -- never let this break the exit stack
+            reasons.append(f"realized-corr compression: unavailable ({exc})")
+
     reasons.append(f"tier 1 (VVIX/VIX divergence, {VIX_LEADING_DIVERGENCE_SESSIONS}d): {'confirmed' if tier1 else 'no'}")
+    reasons.append(
+        f"tier 1b (realized-corr compression, {SVIX_CORR_WINDOW}d <= {SVIX_CORR_PERCENTILE:g}th pct/"
+        f"{SVIX_CORR_LOOKBACK_YEARS:g}y): {'confirmed' if corr_compressed else 'no'}"
+        + (f" (pct={corr_pct:.0f})" if corr_pct is not None else "")
+    )
     reasons.append(f"tier 2 (VIX+VVIX compression, {VIX_LEADING_COMPRESSION_WINDOW}d SD <= {VIX_LEADING_COMPRESSION_PERCENTILE:g}th pct): {'confirmed' if tier2 else 'no'}")
     reasons.append(
         f"tier 3 (run-up exhaustion / VIX-VIX3M ratio down {VIX_LEADING_TERM_STRUCTURE_MIN_PCT:.0%} in "
@@ -311,13 +350,15 @@ def evaluate(
     )
     reasons.append(f"tier 4 (SKEW confirmer, {VIX_LEADING_SKEW_SESSIONS}d): {'confirmed' if tier4 else 'no'}")
 
-    score = sum((tier1, tier2, tier3))  # tier4 never counted -- confirmer only
+    score = sum((tier1, tier2, tier3))  # tier4 + corr-compression not counted -- score stays the historical 0-3
     tier3_sustained = tier3_confirmed_days >= VIX_LEADING_TIER3_CONFIRM_DAYS
-    exit_level = 3 if tier3_sustained else (2 if tier2 else (1 if tier1 else 0))
+    exit_level = 3 if tier3_sustained else (2 if tier2 else (1 if (tier1 or corr_compressed) else 0))
 
     return LeadingSignalResult(
         tier1_divergence=tier1, tier2_compression=tier2,
         tier3_term_structure=tier3, tier4_skew_confirmer=tier4,
         tier3_confirmed_days=tier3_confirmed_days,
-        score=score, exit_level=exit_level, reasons=reasons,
+        score=score, exit_level=exit_level,
+        corr_compression=corr_compressed, corr_percentile=corr_pct,
+        reasons=reasons,
     )
