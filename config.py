@@ -14,6 +14,12 @@ RH_PASSWORD = os.getenv("RH_PASSWORD")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 IMESSAGE_RECIPIENT = os.getenv("IMESSAGE_RECIPIENT")
 
+# Discord webhooks -- one per bot (see alerts/notify.py::send_alert). Unset
+# -> that bot's alerts go to iMessage only. Secrets: live in .env (gitignored).
+DISCORD_WEBHOOK_VIX = os.getenv("DISCORD_WEBHOOK_VIX")
+DISCORD_WEBHOOK_RH = os.getenv("DISCORD_WEBHOOK_RH")
+DISCORD_WEBHOOK_SCANNER = os.getenv("DISCORD_WEBHOOK_SCANNER")
+
 BASE_DIR = pathlib.Path(__file__).parent
 SNAPSHOTS_DIR = BASE_DIR / "data" / "snapshots"
 POSITIONS_FILE = BASE_DIR / "data" / "positions" / "positions.json"

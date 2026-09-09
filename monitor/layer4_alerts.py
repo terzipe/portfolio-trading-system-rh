@@ -7,8 +7,8 @@ Renders a terminal dashboard and fires iMessage alerts.
 import json
 import datetime
 import pathlib
-from config import SNAPSHOTS_DIR, MAX_DAILY_LOSS_PCT, ACCOUNT_BUDGET
-from alerts.imessage import send_imessage
+from config import SNAPSHOTS_DIR, MAX_DAILY_LOSS_PCT, ACCOUNT_BUDGET, DISCORD_WEBHOOK_SCANNER
+from alerts.notify import send_alert
 
 IV_SPIKE_THRESHOLD = 0.10  # 10 percentage point IV move triggers alert
 TARGET_PCT = 50.0           # profit target per position (%)
@@ -143,6 +143,6 @@ def run(valued_positions: list[dict], analytics: dict, market: dict, send_alert:
 
     if alerts and send_alert:
         message = f"RH Tracker Alert {analytics['as_of']}:\n" + "\n".join(alerts)
-        send_imessage(message)
+        send_alert(message, webhook_url=DISCORD_WEBHOOK_SCANNER)
 
     return alerts
