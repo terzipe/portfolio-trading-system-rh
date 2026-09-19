@@ -5,16 +5,17 @@ One place every caller gets a market-data client from, instead of each
 importing data.unusual_whales directly. Backend selected via the
 DATA_BACKEND env var:
   "uw"    (default) — byte-for-byte today's behavior, pure UW passthrough.
-  "dual"  (P1, added 2026-09-19) — mixed authority, decided PER METHOD
+  "dual"  (P1/P2, added 2026-09-19) — mixed authority, decided PER METHOD
           (see _DualBackend's own docstring for the exact split and why):
           last_price() is still UW-authoritative (pure shadow, per the
           plan's "shadow for a few RTH sessions before flipping" step);
-          ohlc() was flipped to Alpaca-authoritative the same day after
-          the shadow log caught UW's own history data for UVXY/VXX
-          wildly wrong vs. both Alpaca and yfinance. Every comparison
-          (whichever side isn't authoritative for that call) is logged to
-          data/vix/market_data_shadow_log.jsonl and can never affect what
-          the caller gets back.
+          ohlc() and vix_term() were both flipped to non-UW authoritative
+          the same day, after the shadow log caught UW's own data wildly
+          wrong on both fronts (UVXY/VXX history vs. Alpaca+yfinance; the
+          synthetic VIX/VIX3M estimate running ~20% high vs. FRED+
+          yfinance). Every comparison (whichever side isn't authoritative
+          for that call) is logged to data/vix/market_data_shadow_log.jsonl
+          and can never affect what the caller gets back.
   "alpaca_fred" (P2+, not yet implemented) — the actual cutover backend;
           selecting it today raises MarketDataError.
 
@@ -53,6 +54,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 
 
@@ -145,7 +147,24 @@ class _DualBackend:
         already treats too-short/empty history as "no momentum decision",
         same fail-closed convention as everywhere else in this codebase.
 
-      vix_term() / option_chain() -- UW only, unchanged (P2/P3 scope).
+      vix_term() -- FRED/Yahoo (data.fred_yahoo_term.FredYahooTermStructure)
+        is now AUTHORITATIVE (returned value); UW is called alongside only
+        to log a diff, kept purely for continued observation. Flipped
+        2026-09-19, same day as ohlc(), after confirming live (and getting
+        explicit sign-off given how central this is -- it feeds every
+        posture/gate decision) that UW's synthetic estimate runs ~3pt /
+        ~20% above the real VIX, with FRED and yfinance agreeing with each
+        other exactly across the last 10 sessions -- e.g. Gate A's cheap-
+        vol threshold (14.97) was actually crossed on 2026-09-18 (real
+        close 14.81) but read "no" under UW's inflated ~18.0. The
+        VIX/VIX3M ratio itself was also distorted (0.945 UW vs 0.810 real
+        -- materially different contango depth), not just the level. On a
+        FRED+Yahoo failure, vix_term() fails CLOSED (vix=vix3m=None,
+        error set) rather than falling back to UW's now-proven-unreliable
+        estimate -- vix_regime.py already treats a None vix as "no data,
+        fail closed to CASH", the same convention as everywhere else.
+
+      option_chain() -- UW only, unchanged (P3 scope).
 
     Whichever side is NOT authoritative for a given method can never raise
     into the caller -- its failure is logged and swallowed."""
@@ -160,6 +179,8 @@ class _DualBackend:
         except Exception as exc:  # noqa: BLE001
             print(f"[market_data:dual] Alpaca secondary unavailable, shadow logging disabled: {exc}", file=sys.stderr)
             self._secondary = None
+        from data.fred_yahoo_term import FredYahooTermStructure
+        self._term_source = FredYahooTermStructure()  # authoritative for vix_term() -- see class docstring
 
     def _shadow(self, method: str, ticker: str | None, returned_value, returned_source: str,
                compared_source: str, compare_fn) -> None:
@@ -209,8 +230,29 @@ class _DualBackend:
         return val
 
     def vix_term(self) -> dict:
-        # P2 scope (FRED/Yahoo), not P1 -- pass through to UW unchanged for now.
-        return self._primary.vix_term()
+        # FRED/Yahoo is authoritative here -- see class docstring. No
+        # fallback to UW on failure: fail closed instead, since UW's own
+        # synthetic estimate has been proven to run ~20% high for a
+        # sustained period, not a one-off blip worth falling back to.
+        try:
+            val = self._term_source.vix_term()
+        except Exception as exc:  # noqa: BLE001
+            val = {
+                "vix": None, "vix3m": None, "vx1": None, "vx2": None,
+                "source": None, "warning": None,
+                "error": f"FRED/Yahoo term structure (now authoritative) failed: {exc}",
+                "fetched_at": time.time(),
+            }
+
+        try:
+            uw_term = self._primary.vix_term()
+            uw_vix, uw_vix3m, uw_err = uw_term.get("vix"), uw_term.get("vix3m"), uw_term.get("error")
+        except Exception as exc:  # noqa: BLE001
+            uw_vix = uw_vix3m = None
+            uw_err = str(exc)
+        _log_shadow_diff("vix_term_vix", "VIX", val.get("vix"), "fred_yahoo", uw_vix, "uw", uw_err)
+        _log_shadow_diff("vix_term_vix3m", "VIX3M", val.get("vix3m"), "fred_yahoo", uw_vix3m, "uw", uw_err)
+        return val
 
     def option_chain(self, ticker: str, greeks: bool = True) -> dict:
         # P3 scope (deferred), not P1 -- pass through to UW unchanged.

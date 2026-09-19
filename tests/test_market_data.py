@@ -187,9 +187,53 @@ def test_dual_backend_ohlc_fails_closed_on_alpaca_failure_not_uw_fallback(dual_c
     assert "Alpaca" in row["compared_error"] or "alpaca" in row["compared_error"]
 
 
-def test_dual_backend_vix_term_and_option_chain_pass_through_to_uw_unchanged(dual_client):
+def test_dual_backend_vix_term_returns_fred_yahoo_value_not_uw(dual_client, monkeypatch):
+    # vix_term() was flipped to FRED/Yahoo-authoritative -- must return
+    # 14.81/18.29, NOT the fake UW's 18.0/19.0.
     client, _ = dual_client
-    assert client.vix_term()["vix"] == 18.0
+    fake_source = type("FakeSource", (), {"vix_term": staticmethod(
+        lambda: {"vix": 14.81, "vix3m": 18.29, "source": "yahoo_intraday", "error": None,
+                 "warning": None, "fetched_at": 0.0}
+    )})()
+    monkeypatch.setattr(client, "_term_source", fake_source)
+    term = client.vix_term()
+    assert term["vix"] == 14.81 and term["vix3m"] == 18.29
+
+
+def test_dual_backend_vix_term_logs_uw_as_the_comparison_side(dual_client, monkeypatch):
+    client, log_path = dual_client
+    fake_source = type("FakeSource", (), {"vix_term": staticmethod(
+        lambda: {"vix": 14.81, "vix3m": 18.29, "source": "yahoo_intraday", "error": None,
+                 "warning": None, "fetched_at": 0.0}
+    )})()
+    monkeypatch.setattr(client, "_term_source", fake_source)
+    client.vix_term()
+    lines = [json.loads(l) for l in log_path.read_text().splitlines()]
+    vix_row = next(r for r in lines if r["method"] == "vix_term_vix")
+    vix3m_row = next(r for r in lines if r["method"] == "vix_term_vix3m")
+    # fred_yahoo is now authoritative/returned; uw is the comparison
+    assert vix_row["returned_value"] == 14.81 and vix_row["returned_source"] == "fred_yahoo"
+    assert vix_row["compared_value"] == 18.0 and vix_row["compared_source"] == "uw"
+    assert vix3m_row["returned_value"] == 18.29 and vix3m_row["compared_value"] == 19.0
+
+
+def test_dual_backend_vix_term_fails_closed_on_fred_yahoo_failure_not_uw_fallback(dual_client, monkeypatch):
+    client, log_path = dual_client
+    fake_source = type("FakeSource", (), {"vix_term": staticmethod(
+        lambda: (_ for _ in ()).throw(RuntimeError("fred+yahoo both down"))
+    )})()
+    monkeypatch.setattr(client, "_term_source", fake_source)
+    term = client.vix_term()
+    # must fail CLOSED (None), never fall back to UW's proven-unreliable estimate
+    assert term["vix"] is None and term["vix3m"] is None
+    assert "fred+yahoo both down" in term["error"]
+    row = json.loads(log_path.read_text().splitlines()[0])
+    assert row["returned_value"] is None and row["returned_source"] == "fred_yahoo"
+    assert row["compared_value"] == 18.0 and row["compared_source"] == "uw"  # UW comparison still logged
+
+
+def test_dual_backend_option_chain_passes_through_to_uw_unchanged(dual_client):
+    client, _ = dual_client
     assert client.option_chain("VXX") == {"data": []}
 
 
