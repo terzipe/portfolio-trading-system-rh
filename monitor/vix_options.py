@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 from config import VIX_MIN_DTE, VIX_MAX_DTE, VIX_CALL_MIN_DTE, VIX_CALL_MAX_DTE
-from data.unusual_whales import get_client, UWError
+from data.market_data import get_client  # UW_OFF_ALPACA_CUTOVER_PLAN.md P0
+from data.unusual_whales import UWError
 
 _WIDE_SPREAD_THRESHOLD = 0.08  # bid-ask / mid > 8% -> too illiquid (SRS §7.5)
 _MIN_OI_FLOOR = 50             # config floor; adjust once UW OI distribution is known

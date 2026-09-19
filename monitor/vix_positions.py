@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from alpaca.trading.enums import AssetClass
 
-from data.unusual_whales import get_client
+from data.market_data import get_client  # UW_OFF_ALPACA_CUTOVER_PLAN.md P0
 from monitor import vix_options
 
 _VOL_TICKERS = {"SVIX", "VXX", "UVXY"}

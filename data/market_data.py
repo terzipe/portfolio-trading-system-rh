@@ -1,0 +1,244 @@
+"""
+MarketData adapter — UW_OFF_ALPACA_CUTOVER_PLAN.md, Phase P0.
+
+One place every caller gets a market-data client from, instead of each
+importing data.unusual_whales directly. Backend selected via the
+DATA_BACKEND env var:
+  "uw"    (default) — byte-for-byte today's behavior, pure UW passthrough.
+  "dual"  (P1, added 2026-09-19) — mixed authority, decided PER METHOD
+          (see _DualBackend's own docstring for the exact split and why):
+          last_price() is still UW-authoritative (pure shadow, per the
+          plan's "shadow for a few RTH sessions before flipping" step);
+          ohlc() was flipped to Alpaca-authoritative the same day after
+          the shadow log caught UW's own history data for UVXY/VXX
+          wildly wrong vs. both Alpaca and yfinance. Every comparison
+          (whichever side isn't authoritative for that call) is logged to
+          data/vix/market_data_shadow_log.jsonl and can never affect what
+          the caller gets back.
+  "alpaca_fred" (P2+, not yet implemented) — the actual cutover backend;
+          selecting it today raises MarketDataError.
+
+UWError itself is untouched (still raised directly from
+data/unusual_whales.py, still caught by the existing `except UWError`
+clauses in vix_regime.py/vix_options.py/vix_longvol_gates.py) — those get
+widened to also catch MarketDataError once "alpaca_fred" is real and can
+raise on its own, not before.
+
+Real call surface, audited 2026-09-19 across monitor/vix_regime.py,
+monitor/vix_signals.py (fetch_ticker_history()/fetch_uvxy_history() — these
+call .ohlc() on whatever client object they're handed, duck-typed, so they
+need NO changes as backends are added), monitor/vix_options.py,
+monitor/vix_positions.py, and the 3 root loop scripts (loop_daily_vix.py,
+loop_intraday_vix.py, loop_svix_exit_monitor.py):
+
+  - last_price(ticker) -> float | None
+  - ohlc(ticker, candle_size="1d", **params) -> dict
+      Raw payload shaped {"data": [{"close": ..., "market_time":
+      "r"|"pr"|"po"}, ...]} — the UW shape. A future non-UW backend must
+      reshape its own bars into this so fetch_ticker_history()'s existing
+      regular-session filtering keeps working with zero changes to it.
+  - vix_term() -> dict
+      Same shape UW's vix_term() already returns: vix, vix3m, source,
+      warning|error.
+  - option_chain(ticker, greeks=True) -> dict
+      UW only for now. A future non-UW backend raises MarketDataError —
+      the options sleeve stays frozen there (plan P3), never guesses.
+
+option_contracts() / flow_alerts() / ws_connect() are NOT part of this
+interface — audited 2026-09-19, nothing in the live VIX Trader BOT calls
+them (dead surface on UnusualWhalesClient).
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+
+class MarketDataError(Exception):
+    """Backend-agnostic market-data failure. UW's own UWError is left as
+    its own exception type in P0 (see module docstring) — this class exists
+    so P1+ backends have somewhere to raise into without inventing a new
+    error type per backend."""
+
+
+class _UWBackend:
+    """Delegates every call to the existing UnusualWhalesClient, unchanged.
+    This is the entirety of P0's behavior — a pure passthrough, no new
+    logic, no new failure modes."""
+
+    name = "uw"
+
+    def __init__(self) -> None:
+        from data.unusual_whales import get_client as _uw_get_client
+        self._uw = _uw_get_client()
+
+    def last_price(self, ticker: str) -> float | None:
+        return self._uw.last_price(ticker)
+
+    def ohlc(self, ticker: str, candle_size: str = "1d", **params) -> dict:
+        return self._uw.ohlc(ticker, candle_size=candle_size, **params)
+
+    def vix_term(self) -> dict:
+        return self._uw.vix_term()
+
+    def option_chain(self, ticker: str, greeks: bool = True) -> dict:
+        return self._uw.option_chain(ticker, greeks=greeks)
+
+
+def _shadow_log_path():
+    from config import VIX_DATA_DIR
+    return VIX_DATA_DIR / "market_data_shadow_log.jsonl"
+
+
+def _log_shadow_diff(
+    method: str, ticker: str | None,
+    returned_value, returned_source: str,
+    compared_value, compared_source: str, compared_error: str | None,
+) -> None:
+    """Append one line to the shadow-comparison log. Never raises -- a
+    logging failure must not affect the value actually being returned to
+    the caller. Field names are vendor-neutral (returned_* / compared_*)
+    rather than uw_*/alpaca_* because WHICH vendor is "returned" vs.
+    "compared" differs per method -- see _DualBackend's docstring. Diff is
+    only meaningful for scalar-ish returns; for others we just record
+    whether the comparison call succeeded."""
+    try:
+        diff_pct = None
+        if isinstance(returned_value, (int, float)) and isinstance(compared_value, (int, float)) and returned_value:
+            diff_pct = (compared_value - returned_value) / returned_value
+        row = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "method": method, "ticker": ticker,
+            "returned_value": returned_value, "returned_source": returned_source,
+            "compared_value": compared_value, "compared_source": compared_source,
+            "diff_pct": diff_pct, "compared_error": compared_error,
+        }
+        with open(_shadow_log_path(), "a") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[market_data:dual] shadow-log write failed (non-fatal): {exc}", file=sys.stderr)
+
+
+class _DualBackend:
+    """Mixed-authority backend -- which side is authoritative is decided
+    PER METHOD, not globally, per what's actually been verified so far
+    (UW_OFF_ALPACA_CUTOVER_PLAN.md P1):
+
+      last_price() -- UW still authoritative (returned value); Alpaca is
+        called alongside only to log a diff. Still in the plan's original
+        "shadow for a few RTH sessions before flipping" step -- shadow
+        diffs so far (2026-09-19) are small (<0.4%), not yet flipped.
+
+      ohlc() -- Alpaca is now AUTHORITATIVE (returned value); UW is called
+        alongside only to log a diff, kept purely for continued
+        observation. Flipped 2026-09-19 after the shadow log caught UW's
+        own .ohlc() returning data wildly inconsistent with BOTH Alpaca
+        and yfinance for UVXY/VXX (off by ~3x / ~1.9x, no split-like
+        discontinuity anywhere in 252 days of history -- consistent with a
+        long-stale feed, not a transient blip). This was silently feeding
+        Gate C momentum, the FADE_SPIKE_PUTS UVXY-history check, and SVIX
+        manual-campaign ride-mode's momentum check. On an Alpaca failure,
+        ohlc() fails CLOSED ({"data": []}) rather than falling back to
+        UW's now-proven-unreliable series -- fetch_ticker_history()
+        already treats too-short/empty history as "no momentum decision",
+        same fail-closed convention as everywhere else in this codebase.
+
+      vix_term() / option_chain() -- UW only, unchanged (P2/P3 scope).
+
+    Whichever side is NOT authoritative for a given method can never raise
+    into the caller -- its failure is logged and swallowed."""
+
+    name = "dual"
+
+    def __init__(self) -> None:
+        self._primary = _UWBackend()
+        try:
+            from data.alpaca_quotes import AlpacaQuotes
+            self._secondary = AlpacaQuotes()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[market_data:dual] Alpaca secondary unavailable, shadow logging disabled: {exc}", file=sys.stderr)
+            self._secondary = None
+
+    def _shadow(self, method: str, ticker: str | None, returned_value, returned_source: str,
+               compared_source: str, compare_fn) -> None:
+        """Fetch the comparison side and log a diff. Never raises, never
+        affects `returned_value` -- the comparison side's failure is
+        recorded, not propagated."""
+        try:
+            compared_value = compare_fn()
+            _log_shadow_diff(method, ticker, returned_value, returned_source, compared_value, compared_source, None)
+        except Exception as exc:  # noqa: BLE001
+            _log_shadow_diff(method, ticker, returned_value, returned_source, None, compared_source, str(exc))
+
+    def last_price(self, ticker: str) -> float | None:
+        # UW still authoritative here -- see class docstring.
+        val = self._primary.last_price(ticker)
+        if self._secondary is not None:
+            self._shadow("last_price", ticker, val, "uw", "alpaca", lambda: self._secondary.last_price(ticker))
+        return val
+
+    @staticmethod
+    def _last_regular_close(payload: dict) -> float | None:
+        try:
+            regular = [r for r in payload.get("data", []) if r.get("market_time") == "r"]
+            return float(regular[-1]["close"]) if regular else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def ohlc(self, ticker: str, candle_size: str = "1d", **params) -> dict:
+        # Alpaca is authoritative here -- see class docstring. No fallback
+        # to UW on failure: fail closed instead, since UW's own ohlc() has
+        # been proven unreliable for these tickers.
+        if self._secondary is None:
+            _log_shadow_diff("ohlc_last_close", ticker, None, "alpaca", None, "uw",
+                             "Alpaca unavailable -- failing closed, not falling back to UW's known-stale data")
+            return {"data": []}
+        try:
+            val = self._secondary.ohlc(ticker, candle_size=candle_size, **params)
+        except Exception as exc:  # noqa: BLE001
+            _log_shadow_diff("ohlc_last_close", ticker, None, "alpaca", None, "uw", f"Alpaca (now authoritative) failed: {exc}")
+            return {"data": []}
+
+        alpaca_close = self._last_regular_close(val)
+        self._shadow(
+            "ohlc_last_close", ticker, alpaca_close, "alpaca", "uw",
+            lambda: self._last_regular_close(self._primary.ohlc(ticker, candle_size=candle_size, **params)),
+        )
+        return val
+
+    def vix_term(self) -> dict:
+        # P2 scope (FRED/Yahoo), not P1 -- pass through to UW unchanged for now.
+        return self._primary.vix_term()
+
+    def option_chain(self, ticker: str, greeks: bool = True) -> dict:
+        # P3 scope (deferred), not P1 -- pass through to UW unchanged.
+        return self._primary.option_chain(ticker, greeks=greeks)
+
+
+_BACKENDS = {"uw": _UWBackend, "dual": _DualBackend}
+_client = None
+_client_backend_name: str | None = None
+
+
+def get_client(backend: str | None = None):
+    """Module-level singleton, one per (process, backend) — mirrors
+    data.unusual_whales.get_client()'s one-per-process pattern, but
+    re-inits if the requested backend differs from the cached one (so a
+    runtime DATA_BACKEND flip, or a test passing an explicit backend,
+    swaps cleanly instead of silently keeping a stale client)."""
+    global _client, _client_backend_name
+    backend = backend or os.getenv("DATA_BACKEND", "uw")
+    if _client is not None and _client_backend_name == backend:
+        return _client
+    try:
+        cls = _BACKENDS[backend]
+    except KeyError:
+        raise MarketDataError(
+            f"unknown or not-yet-implemented DATA_BACKEND={backend!r} — implemented: "
+            f"{sorted(_BACKENDS)} ('alpaca_fred' lands in P2+, see UW_OFF_ALPACA_CUTOVER_PLAN.md)"
+        )
+    _client = cls()
+    _client_backend_name = backend
+    return _client

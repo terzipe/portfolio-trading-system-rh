@@ -18,7 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import VIX_DATA_DIR, VIX_STALE_SECONDS, VIX_KILL_SWITCH, VIX_LONGVOL_MOMENTUM_TIE_PCT
-from data.unusual_whales import get_client, UWError
+from data.market_data import get_client  # UW_OFF_ALPACA_CUTOVER_PLAN.md P0
+from data.unusual_whales import UWError
 from monitor.vix_longvol_gates import LongVolGateResult, evaluate as evaluate_longvol_gates
 
 REGIME_TRADER_PATH = Path(__file__).parent.parent.parent / "regime_trader"
