@@ -120,6 +120,7 @@ class _FakeAlpaca:
 @pytest.fixture
 def dual_client(fake_uw, monkeypatch, tmp_path):
     monkeypatch.setattr("data.market_data._shadow_log_path", lambda: tmp_path / "shadow.jsonl")
+    monkeypatch.setattr("config.UW_API_KEY", "test-uw-key")  # dual_client always has UW comparison ON
     return market_data.get_client("dual"), tmp_path / "shadow.jsonl"
 
 
@@ -315,3 +316,57 @@ def test_dual_backend_secondary_unavailable_ohlc_fails_closed(fake_uw, monkeypat
     # ohlc is Alpaca-authoritative -- with no Alpaca available it must fail
     # closed, NOT silently fall back to UW's known-stale ohlc data.
     assert client.ohlc("UVXY") == {"data": []}
+
+
+# ── UW_API_KEY unset (P4/P5 -- the actual cutover lever) ────────────────
+
+@pytest.fixture
+def dual_client_no_uw_key(monkeypatch, tmp_path):
+    """UW_API_KEY unset -- _primary must never be constructed or called.
+    Deliberately does NOT use the fake_uw fixture: data.unusual_whales.
+    get_client must never even be reached, so leaving it unpatched (and
+    letting a call to it fail loudly if one somehow happened) is itself
+    part of the test."""
+    monkeypatch.setattr("config.UW_API_KEY", None)
+    monkeypatch.setattr("data.market_data._shadow_log_path", lambda: tmp_path / "shadow.jsonl")
+    return market_data.get_client("dual"), tmp_path / "shadow.jsonl"
+
+
+def test_dual_backend_no_uw_key_never_constructs_primary(dual_client_no_uw_key):
+    client, _ = dual_client_no_uw_key
+    assert client._primary is None
+
+
+def test_dual_backend_no_uw_key_last_price_still_returns_alpaca_value(dual_client_no_uw_key, monkeypatch):
+    client, log_path = dual_client_no_uw_key
+    monkeypatch.setattr(client, "_secondary", _FakeAlpaca(price=28.44))
+    assert client.last_price("SVIX") == 28.44
+    assert not log_path.exists()  # no UW comparison attempted -> nothing to log
+
+
+def test_dual_backend_no_uw_key_ohlc_still_returns_alpaca_value(dual_client_no_uw_key, monkeypatch):
+    client, log_path = dual_client_no_uw_key
+    monkeypatch.setattr(client, "_secondary", _FakeAlpaca(price=17.53))
+    assert client.ohlc("UVXY") == {"data": [{"close": "17.53", "market_time": "r"}]}
+    assert not log_path.exists()
+
+
+def test_dual_backend_no_uw_key_vix_term_still_returns_fred_yahoo_value(dual_client_no_uw_key, monkeypatch):
+    client, log_path = dual_client_no_uw_key
+    fake_source = type("FakeSource", (), {"vix_term": staticmethod(
+        lambda: {"vix": 14.81, "vix3m": 18.29, "source": "yahoo_intraday", "error": None,
+                 "warning": None, "fetched_at": 0.0}
+    )})()
+    monkeypatch.setattr(client, "_term_source", fake_source)
+    term = client.vix_term()
+    assert term["vix"] == 14.81 and term["vix3m"] == 18.29
+    assert not log_path.exists()
+
+
+def test_dual_backend_no_uw_key_option_chain_still_returns_alpaca_value(dual_client_no_uw_key, monkeypatch):
+    client, log_path = dual_client_no_uw_key
+    rows = [{"option_type": "call", "expires": "2026-10-16", "strike": 18.0,
+             "nbbo_bid": 0.84, "nbbo_ask": 0.88, "delta": 0.4854, "open_interest": None}]
+    monkeypatch.setattr(client, "_options_source", _FakeAlpacaOptions(rows=rows))
+    assert client.option_chain("VXX") == {"data": rows}
+    assert not log_path.exists()

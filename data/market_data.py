@@ -5,18 +5,19 @@ One place every caller gets a market-data client from, instead of each
 importing data.unusual_whales directly. Backend selected via the
 DATA_BACKEND env var:
   "uw"    (default) — byte-for-byte today's behavior, pure UW passthrough.
-  "dual"  (P1/P2/P3, added 2026-09-19, completed 2026-09-21) — mixed
-          authority, decided PER METHOD (see _DualBackend's own docstring
-          for the exact split and why). ALL FOUR methods are now non-UW-
-          authoritative -- UW is called on every one purely for continued
-          comparison logging, and can never affect what's returned. This
-          is now functionally the full cutover: nothing in a live
-          decision path reads from UW anymore. UW stays wired in only
-          because the comparison logging is free confidence -- dropping
-          it (and the UW_API_KEY dependency entirely) is P4/P5, a
-          deliberate later step, not something this phase does on its
-          own. Every comparison is logged to
-          data/vix/market_data_shadow_log.jsonl.
+  "dual"  (P1/P2/P3 added 2026-09-19/21; P4/P5 gating added 2026-09-21) —
+          mixed authority, decided PER METHOD (see _DualBackend's own
+          docstring for the exact split and why). ALL FOUR methods are
+          non-UW-authoritative -- UW is called on every one purely for
+          comparison logging (data/vix/market_data_shadow_log.jsonl),
+          and can never affect what's returned. That comparison call is
+          itself gated on config.UW_API_KEY being set: with the key
+          present, "dual" behaves as above (Alpaca/FRED/Yahoo values,
+          UW comparison logged); with the key unset (or removed
+          entirely, the actual cutover step), UW is never constructed or
+          called at all -- "dual" becomes a pure Alpaca/FRED/Yahoo
+          backend with zero UW dependency, no code change required
+          beyond removing the key from .env.
 
 UWError itself is untouched (still raised directly from
 data/unusual_whales.py, still caught by the existing `except UWError`
@@ -190,12 +191,26 @@ class _DualBackend:
         the same fail-closed convention as everywhere else.
 
     Whichever side is NOT authoritative for a given method can never raise
-    into the caller -- its failure is logged and swallowed."""
+    into the caller -- its failure is logged and swallowed.
+
+    UW comparison calls are gated on config.UW_API_KEY (P4/P5,
+    2026-09-21): once the key is unset, `self._primary` stays None and
+    every method below skips its UW comparison entirely -- no wasted
+    request, no log spam, no UWError to swallow. This is what actually
+    lets the UW subscription be cancelled: removing the key from .env is
+    the one lever that turns "dual" into a pure Alpaca/FRED/Yahoo backend
+    with zero remaining UW calls, with no other code change required."""
 
     name = "dual"
 
     def __init__(self) -> None:
-        self._primary = _UWBackend()
+        from config import UW_API_KEY
+        if UW_API_KEY:
+            self._primary = _UWBackend()
+        else:
+            print("[market_data:dual] UW_API_KEY unset -- shadow comparison logging disabled, "
+                  "running Alpaca/FRED/Yahoo only.", file=sys.stderr)
+            self._primary = None
         try:
             from data.alpaca_quotes import AlpacaQuotes
             self._secondary = AlpacaQuotes()
@@ -236,7 +251,8 @@ class _DualBackend:
             _log_shadow_diff("last_price", ticker, None, "alpaca", None, "uw", f"Alpaca (now authoritative) failed: {exc}")
             return None
 
-        self._shadow("last_price", ticker, val, "alpaca", "uw", lambda: self._primary.last_price(ticker))
+        if self._primary is not None:
+            self._shadow("last_price", ticker, val, "alpaca", "uw", lambda: self._primary.last_price(ticker))
         return val
 
     @staticmethod
@@ -262,10 +278,11 @@ class _DualBackend:
             return {"data": []}
 
         alpaca_close = self._last_regular_close(val)
-        self._shadow(
-            "ohlc_last_close", ticker, alpaca_close, "alpaca", "uw",
-            lambda: self._last_regular_close(self._primary.ohlc(ticker, candle_size=candle_size, **params)),
-        )
+        if self._primary is not None:
+            self._shadow(
+                "ohlc_last_close", ticker, alpaca_close, "alpaca", "uw",
+                lambda: self._last_regular_close(self._primary.ohlc(ticker, candle_size=candle_size, **params)),
+            )
         return val
 
     def vix_term(self) -> dict:
@@ -283,14 +300,15 @@ class _DualBackend:
                 "fetched_at": time.time(),
             }
 
-        try:
-            uw_term = self._primary.vix_term()
-            uw_vix, uw_vix3m, uw_err = uw_term.get("vix"), uw_term.get("vix3m"), uw_term.get("error")
-        except Exception as exc:  # noqa: BLE001
-            uw_vix = uw_vix3m = None
-            uw_err = str(exc)
-        _log_shadow_diff("vix_term_vix", "VIX", val.get("vix"), "fred_yahoo", uw_vix, "uw", uw_err)
-        _log_shadow_diff("vix_term_vix3m", "VIX3M", val.get("vix3m"), "fred_yahoo", uw_vix3m, "uw", uw_err)
+        if self._primary is not None:
+            try:
+                uw_term = self._primary.vix_term()
+                uw_vix, uw_vix3m, uw_err = uw_term.get("vix"), uw_term.get("vix3m"), uw_term.get("error")
+            except Exception as exc:  # noqa: BLE001
+                uw_vix = uw_vix3m = None
+                uw_err = str(exc)
+            _log_shadow_diff("vix_term_vix", "VIX", val.get("vix"), "fred_yahoo", uw_vix, "uw", uw_err)
+            _log_shadow_diff("vix_term_vix3m", "VIX3M", val.get("vix3m"), "fred_yahoo", uw_vix3m, "uw", uw_err)
         return val
 
     def option_chain(self, ticker: str, greeks: bool = True) -> dict:
@@ -309,13 +327,14 @@ class _DualBackend:
 
         # A full chain isn't a scalar -- log contract COUNT as the diff
         # proxy (a rough liquidity/coverage sanity check), not a price diff.
-        alpaca_n = len(val.get("data", []))
+        if self._primary is not None:
+            alpaca_n = len(val.get("data", []))
 
-        def _uw_n():
-            uw_val = self._primary.option_chain(ticker, greeks=greeks)
-            return len(uw_val.get("data", []))
+            def _uw_n():
+                uw_val = self._primary.option_chain(ticker, greeks=greeks)
+                return len(uw_val.get("data", []))
 
-        self._shadow("option_chain_n", ticker, alpaca_n, "alpaca", "uw", _uw_n)
+            self._shadow("option_chain_n", ticker, alpaca_n, "alpaca", "uw", _uw_n)
         return val
 
 
