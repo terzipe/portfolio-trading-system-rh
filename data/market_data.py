@@ -6,18 +6,21 @@ importing data.unusual_whales directly. Backend selected via the
 DATA_BACKEND env var:
   "uw"    (default) — byte-for-byte today's behavior, pure UW passthrough.
   "dual"  (P1/P2, added 2026-09-19) — mixed authority, decided PER METHOD
-          (see _DualBackend's own docstring for the exact split and why):
-          last_price() is still UW-authoritative (pure shadow, per the
-          plan's "shadow for a few RTH sessions before flipping" step);
-          ohlc() and vix_term() were both flipped to non-UW authoritative
-          the same day, after the shadow log caught UW's own data wildly
-          wrong on both fronts (UVXY/VXX history vs. Alpaca+yfinance; the
-          synthetic VIX/VIX3M estimate running ~20% high vs. FRED+
-          yfinance). Every comparison (whichever side isn't authoritative
-          for that call) is logged to data/vix/market_data_shadow_log.jsonl
+          (see _DualBackend's own docstring for the exact split and why).
+          All three live methods (last_price/ohlc/vix_term) are now
+          non-UW-authoritative as of 2026-09-21 -- UW is called on every
+          one purely for continued comparison logging, never affecting
+          what's returned. option_chain() is the one method still UW-only
+          (P3, deferred while the options sleeve is flat). Every
+          comparison is logged to data/vix/market_data_shadow_log.jsonl
           and can never affect what the caller gets back.
-  "alpaca_fred" (P2+, not yet implemented) — the actual cutover backend;
-          selecting it today raises MarketDataError.
+  "alpaca_fred" (P3+, not yet a distinct backend) — would be the fully
+          UW-free backend (option_chain() covered too); selecting it
+          today raises MarketDataError. Not built yet because the only
+          gap is option_chain(), and the options sleeve is currently
+          flat/frozen -- no urgency. See module/plan for the P3 tradeoff:
+          build it, or accept the UW key stays live at ~$0 marginal cost
+          just for that one dead-while-flat call path.
 
 UWError itself is untouched (still raised directly from
 data/unusual_whales.py, still caught by the existing `except UWError`
@@ -128,10 +131,16 @@ class _DualBackend:
     PER METHOD, not globally, per what's actually been verified so far
     (UW_OFF_ALPACA_CUTOVER_PLAN.md P1):
 
-      last_price() -- UW still authoritative (returned value); Alpaca is
-        called alongside only to log a diff. Still in the plan's original
-        "shadow for a few RTH sessions before flipping" step -- shadow
-        diffs so far (2026-09-19) are small (<0.4%), not yet flipped.
+      last_price() -- Alpaca is now AUTHORITATIVE (returned value); UW is
+        called alongside only to log a diff. Flipped 2026-09-21 after a
+        full live RTH session of shadow data: 2,671 comparisons, mean
+        diff 0.04%, max 1.6% -- UW and Alpaca agree tightly, nothing like
+        the ohlc()/vix_term() discrepancies. On an Alpaca failure,
+        last_price() fails closed (returns None) rather than falling back
+        to UW -- every caller of last_price() already treats a None
+        price as "no quote this cycle, skip" (see e.g. vix_positions.py's
+        `uw.last_price(ticker) or avg_cost` and the loop scripts' `_quote()`
+        helpers), so this is a pre-existing convention, not a new one.
 
       ohlc() -- Alpaca is now AUTHORITATIVE (returned value); UW is called
         alongside only to log a diff, kept purely for continued
@@ -194,10 +203,20 @@ class _DualBackend:
             _log_shadow_diff(method, ticker, returned_value, returned_source, None, compared_source, str(exc))
 
     def last_price(self, ticker: str) -> float | None:
-        # UW still authoritative here -- see class docstring.
-        val = self._primary.last_price(ticker)
-        if self._secondary is not None:
-            self._shadow("last_price", ticker, val, "uw", "alpaca", lambda: self._secondary.last_price(ticker))
+        # Alpaca is authoritative here -- see class docstring. No fallback
+        # to UW on failure: fail closed (None) instead, matching every
+        # caller's existing "no quote this cycle" handling of a None price.
+        if self._secondary is None:
+            _log_shadow_diff("last_price", ticker, None, "alpaca", None, "uw",
+                             "Alpaca unavailable -- failing closed")
+            return None
+        try:
+            val = self._secondary.last_price(ticker)
+        except Exception as exc:  # noqa: BLE001
+            _log_shadow_diff("last_price", ticker, None, "alpaca", None, "uw", f"Alpaca (now authoritative) failed: {exc}")
+            return None
+
+        self._shadow("last_price", ticker, val, "alpaca", "uw", lambda: self._primary.last_price(ticker))
         return val
 
     @staticmethod

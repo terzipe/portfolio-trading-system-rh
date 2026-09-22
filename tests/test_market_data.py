@@ -123,15 +123,15 @@ def dual_client(fake_uw, monkeypatch, tmp_path):
     return market_data.get_client("dual"), tmp_path / "shadow.jsonl"
 
 
-def test_dual_backend_last_price_returns_uw_value_not_alpaca(dual_client, monkeypatch):
+def test_dual_backend_last_price_returns_alpaca_value_not_uw(dual_client, monkeypatch):
     client, _ = dual_client
     monkeypatch.setattr(client, "_secondary", _FakeAlpaca(price=99.0))
-    # fake UW returns 28.5 for SVIX (see _FakeUWClient) -- last_price() is
-    # still UW-authoritative, so dual must return THAT, not 99.0.
-    assert client.last_price("SVIX") == 28.5
+    # fake UW returns 28.5 for SVIX (see _FakeUWClient) -- last_price() was
+    # flipped to Alpaca-authoritative, so dual must return 99.0, not 28.5.
+    assert client.last_price("SVIX") == 99.0
 
 
-def test_dual_backend_writes_shadow_log_with_diff_last_price(dual_client, monkeypatch):
+def test_dual_backend_last_price_logs_uw_as_the_comparison_side(dual_client, monkeypatch):
     client, log_path = dual_client
     monkeypatch.setattr(client, "_secondary", _FakeAlpaca(price=29.925))  # +5% vs UW's 28.5
     client.last_price("SVIX")
@@ -139,20 +139,21 @@ def test_dual_backend_writes_shadow_log_with_diff_last_price(dual_client, monkey
     assert len(lines) == 1
     row = json.loads(lines[0])
     assert row["method"] == "last_price" and row["ticker"] == "SVIX"
-    # last_price: UW is still authoritative/returned, Alpaca is the comparison
-    assert row["returned_value"] == 28.5 and row["returned_source"] == "uw"
-    assert row["compared_value"] == 29.925 and row["compared_source"] == "alpaca"
-    assert row["diff_pct"] == pytest.approx(0.05)
+    # alpaca is now authoritative/returned; uw is the comparison
+    assert row["returned_value"] == 29.925 and row["returned_source"] == "alpaca"
+    assert row["compared_value"] == 28.5 and row["compared_source"] == "uw"
+    assert row["diff_pct"] == pytest.approx((28.5 - 29.925) / 29.925)
     assert row["compared_error"] is None
 
 
-def test_dual_backend_logs_last_price_comparison_failure_without_raising(dual_client, monkeypatch):
+def test_dual_backend_last_price_fails_closed_on_alpaca_failure_not_uw_fallback(dual_client, monkeypatch):
     client, log_path = dual_client
     monkeypatch.setattr(client, "_secondary", _FakeAlpaca(boom=True))
     val = client.last_price("SVIX")
-    assert val == 28.5  # UW result still returned -- Alpaca is only the comparison here
+    # must fail CLOSED (None), never fall back to UW
+    assert val is None
     row = json.loads(log_path.read_text().splitlines()[0])
-    assert row["compared_value"] is None
+    assert row["returned_value"] is None and row["returned_source"] == "alpaca"
     assert "alpaca down" in row["compared_error"]
 
 
@@ -237,7 +238,7 @@ def test_dual_backend_option_chain_passes_through_to_uw_unchanged(dual_client):
     assert client.option_chain("VXX") == {"data": []}
 
 
-def test_dual_backend_secondary_unavailable_last_price_still_works_no_log(fake_uw, monkeypatch, tmp_path):
+def test_dual_backend_secondary_unavailable_last_price_fails_closed(fake_uw, monkeypatch, tmp_path):
     monkeypatch.setattr("data.market_data._shadow_log_path", lambda: tmp_path / "shadow.jsonl")
     monkeypatch.setattr(
         "data.alpaca_quotes.AlpacaQuotes",
@@ -245,8 +246,9 @@ def test_dual_backend_secondary_unavailable_last_price_still_works_no_log(fake_u
     )
     client = market_data.get_client("dual")
     assert client._secondary is None
-    assert client.last_price("SVIX") == 28.5  # UW still authoritative, still works
-    assert not (tmp_path / "shadow.jsonl").exists()
+    # last_price is Alpaca-authoritative -- with no Alpaca available it
+    # must fail closed, NOT silently fall back to UW.
+    assert client.last_price("SVIX") is None
 
 
 def test_dual_backend_secondary_unavailable_ohlc_fails_closed(fake_uw, monkeypatch, tmp_path):
