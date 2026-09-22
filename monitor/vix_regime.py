@@ -211,7 +211,7 @@ def compute_posture(
         return CASH, bias_family, reasons, None
 
     if data_age_sec > VIX_STALE_SECONDS:
-        reasons.append(f"UW data stale ({data_age_sec:.0f}s > {VIX_STALE_SECONDS}s) -> no new buys")
+        reasons.append(f"VIX/VIX3M data stale ({data_age_sec:.0f}s > {VIX_STALE_SECONDS}s) -> no new buys")
         return CASH, bias_family, reasons, None
 
     if fade_spike_ok:
@@ -264,7 +264,7 @@ def run(fade_spike_ok: bool = False) -> RegimeResult:
         term = uw.vix_term()
         data_age_sec = time.time() - term.get("fetched_at", time.time())
     except UWError as exc:
-        print(f"[vix_regime] UW vix_term() failed: {exc}")
+        print(f"[vix_regime] vix_term() failed: {exc}")
         term = {"vix": None, "vix3m": None, "vx1": None, "vx2": None}
         data_age_sec = float("inf")
 
