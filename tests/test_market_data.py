@@ -233,8 +233,62 @@ def test_dual_backend_vix_term_fails_closed_on_fred_yahoo_failure_not_uw_fallbac
     assert row["compared_value"] == 18.0 and row["compared_source"] == "uw"  # UW comparison still logged
 
 
-def test_dual_backend_option_chain_passes_through_to_uw_unchanged(dual_client):
+class _FakeAlpacaOptions:
+    name = "alpaca_options"
+
+    def __init__(self, rows=None, boom=False):
+        self._rows = rows if rows is not None else [{"option_type": "put", "expires": "2026-10-23",
+                                                      "strike": 37.0, "nbbo_bid": 18.96, "nbbo_ask": 21.02,
+                                                      "delta": -0.231, "open_interest": None}]
+        self._boom = boom
+
+    def option_chain(self, ticker, greeks=True):
+        if self._boom:
+            raise market_data.MarketDataError("alpaca options down")
+        return {"data": self._rows}
+
+
+def test_dual_backend_option_chain_returns_alpaca_value_not_uw(dual_client, monkeypatch):
     client, _ = dual_client
+    fake_rows = [{"option_type": "put", "expires": "2026-10-23", "strike": 37.0,
+                  "nbbo_bid": 18.96, "nbbo_ask": 21.02, "delta": -0.231, "open_interest": None}]
+    monkeypatch.setattr(client, "_options_source", _FakeAlpacaOptions(rows=fake_rows))
+    # fake UW's option_chain always returns {"data": []} (see _FakeUWClient)
+    # -- dual must return the Alpaca rows, not UW's empty chain.
+    payload = client.option_chain("VXX")
+    assert payload == {"data": fake_rows}
+
+
+def test_dual_backend_option_chain_logs_uw_as_the_comparison_side(dual_client, monkeypatch):
+    client, log_path = dual_client
+    monkeypatch.setattr(client, "_options_source", _FakeAlpacaOptions())  # 1 row
+    client.option_chain("VXX")
+    row = json.loads(log_path.read_text().splitlines()[0])
+    assert row["method"] == "option_chain_n" and row["ticker"] == "VXX"
+    # alpaca is authoritative/returned (1 contract); uw is the comparison (0, per _FakeUWClient)
+    assert row["returned_value"] == 1 and row["returned_source"] == "alpaca"
+    assert row["compared_value"] == 0 and row["compared_source"] == "uw"
+
+
+def test_dual_backend_option_chain_fails_closed_on_alpaca_failure_not_uw_fallback(dual_client, monkeypatch):
+    client, log_path = dual_client
+    monkeypatch.setattr(client, "_options_source", _FakeAlpacaOptions(boom=True))
+    payload = client.option_chain("VXX")
+    # must fail CLOSED (empty), never fall back to UW
+    assert payload == {"data": []}
+    row = json.loads(log_path.read_text().splitlines()[0])
+    assert row["returned_value"] is None and row["returned_source"] == "alpaca"
+    assert "alpaca options down" in row["compared_error"]
+
+
+def test_dual_backend_secondary_unavailable_option_chain_fails_closed(fake_uw, monkeypatch, tmp_path):
+    monkeypatch.setattr("data.market_data._shadow_log_path", lambda: tmp_path / "shadow.jsonl")
+    monkeypatch.setattr(
+        "data.alpaca_options.AlpacaOptions",
+        lambda: (_ for _ in ()).throw(market_data.MarketDataError("no creds")),
+    )
+    client = market_data.get_client("dual")
+    assert client._options_source is None
     assert client.option_chain("VXX") == {"data": []}
 
 

@@ -5,22 +5,18 @@ One place every caller gets a market-data client from, instead of each
 importing data.unusual_whales directly. Backend selected via the
 DATA_BACKEND env var:
   "uw"    (default) — byte-for-byte today's behavior, pure UW passthrough.
-  "dual"  (P1/P2, added 2026-09-19) — mixed authority, decided PER METHOD
-          (see _DualBackend's own docstring for the exact split and why).
-          All three live methods (last_price/ohlc/vix_term) are now
-          non-UW-authoritative as of 2026-09-21 -- UW is called on every
-          one purely for continued comparison logging, never affecting
-          what's returned. option_chain() is the one method still UW-only
-          (P3, deferred while the options sleeve is flat). Every
-          comparison is logged to data/vix/market_data_shadow_log.jsonl
-          and can never affect what the caller gets back.
-  "alpaca_fred" (P3+, not yet a distinct backend) — would be the fully
-          UW-free backend (option_chain() covered too); selecting it
-          today raises MarketDataError. Not built yet because the only
-          gap is option_chain(), and the options sleeve is currently
-          flat/frozen -- no urgency. See module/plan for the P3 tradeoff:
-          build it, or accept the UW key stays live at ~$0 marginal cost
-          just for that one dead-while-flat call path.
+  "dual"  (P1/P2/P3, added 2026-09-19, completed 2026-09-21) — mixed
+          authority, decided PER METHOD (see _DualBackend's own docstring
+          for the exact split and why). ALL FOUR methods are now non-UW-
+          authoritative -- UW is called on every one purely for continued
+          comparison logging, and can never affect what's returned. This
+          is now functionally the full cutover: nothing in a live
+          decision path reads from UW anymore. UW stays wired in only
+          because the comparison logging is free confidence -- dropping
+          it (and the UW_API_KEY dependency entirely) is P4/P5, a
+          deliberate later step, not something this phase does on its
+          own. Every comparison is logged to
+          data/vix/market_data_shadow_log.jsonl.
 
 UWError itself is untouched (still raised directly from
 data/unusual_whales.py, still caught by the existing `except UWError`
@@ -45,8 +41,11 @@ loop_intraday_vix.py, loop_svix_exit_monitor.py):
       Same shape UW's vix_term() already returns: vix, vix3m, source,
       warning|error.
   - option_chain(ticker, greeks=True) -> dict
-      UW only for now. A future non-UW backend raises MarketDataError —
-      the options sleeve stays frozen there (plan P3), never guesses.
+      Raw payload shaped {"data": [{"option_type", "expires", "strike",
+      "nbbo_bid", "nbbo_ask", "delta", "open_interest"}, ...]} — the UW
+      shape. monitor/vix_options.py's own DTE/liquidity filtering reads
+      exactly these field names, so a non-UW backend must reshape into
+      this, not raise (see data/alpaca_options.py, P3).
 
 option_contracts() / flow_alerts() / ws_connect() are NOT part of this
 interface — audited 2026-09-19, nothing in the live VIX Trader BOT calls
@@ -173,7 +172,22 @@ class _DualBackend:
         estimate -- vix_regime.py already treats a None vix as "no data,
         fail closed to CASH", the same convention as everywhere else.
 
-      option_chain() -- UW only, unchanged (P3 scope).
+      option_chain() -- Alpaca (data.alpaca_options.AlpacaOptions) is now
+        AUTHORITATIVE (returned value); UW is called alongside only to
+        log a diff. Flipped 2026-09-21, live-verified: 100% real bid/ask
+        coverage on UVXY/VXX in every DTE window this codebase actually
+        filters to (10-21d and 21-45d). Two deliberate gaps vs. UW's
+        payload, both audited as harmless to every live caller (see
+        data/alpaca_options.py's module docstring for the detail):
+        open_interest is always None (Alpaca's option snapshot has no OI
+        field; _is_liquid()'s OI check already tolerates None as
+        "unknown", not "illiquid"), and only ~40-45% of contracts carry a
+        live delta (pick_call() already has a full-pool fallback for
+        when nothing in range has one). On an Alpaca failure,
+        option_chain() fails CLOSED ({"data": []}) rather than falling
+        back to UW -- every picker (pick_put/pick_call/get_contract_quote)
+        already treats an empty/no-match chain as "no contract found",
+        the same fail-closed convention as everywhere else.
 
     Whichever side is NOT authoritative for a given method can never raise
     into the caller -- its failure is logged and swallowed."""
@@ -188,6 +202,12 @@ class _DualBackend:
         except Exception as exc:  # noqa: BLE001
             print(f"[market_data:dual] Alpaca secondary unavailable, shadow logging disabled: {exc}", file=sys.stderr)
             self._secondary = None
+        try:
+            from data.alpaca_options import AlpacaOptions
+            self._options_source = AlpacaOptions()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[market_data:dual] Alpaca options unavailable, option_chain() will fail closed: {exc}", file=sys.stderr)
+            self._options_source = None
         from data.fred_yahoo_term import FredYahooTermStructure
         self._term_source = FredYahooTermStructure()  # authoritative for vix_term() -- see class docstring
 
@@ -274,8 +294,29 @@ class _DualBackend:
         return val
 
     def option_chain(self, ticker: str, greeks: bool = True) -> dict:
-        # P3 scope (deferred), not P1 -- pass through to UW unchanged.
-        return self._primary.option_chain(ticker, greeks=greeks)
+        # Alpaca is authoritative here -- see class docstring. No fallback
+        # to UW on failure: fail closed instead, same convention as
+        # ohlc()/vix_term().
+        if self._options_source is None:
+            _log_shadow_diff("option_chain_n", ticker, None, "alpaca", None, "uw",
+                             "Alpaca options unavailable -- failing closed")
+            return {"data": []}
+        try:
+            val = self._options_source.option_chain(ticker, greeks=greeks)
+        except Exception as exc:  # noqa: BLE001
+            _log_shadow_diff("option_chain_n", ticker, None, "alpaca", None, "uw", f"Alpaca (now authoritative) failed: {exc}")
+            return {"data": []}
+
+        # A full chain isn't a scalar -- log contract COUNT as the diff
+        # proxy (a rough liquidity/coverage sanity check), not a price diff.
+        alpaca_n = len(val.get("data", []))
+
+        def _uw_n():
+            uw_val = self._primary.option_chain(ticker, greeks=greeks)
+            return len(uw_val.get("data", []))
+
+        self._shadow("option_chain_n", ticker, alpaca_n, "alpaca", "uw", _uw_n)
+        return val
 
 
 _BACKENDS = {"uw": _UWBackend, "dual": _DualBackend}
